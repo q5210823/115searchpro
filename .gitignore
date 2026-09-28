@@ -1,0 +1,19 @@
+# 依赖（本项目的构建脚本零依赖，这里只是保险）
+node_modules/
+
+# 平台 / 工具目录，不随仓库分发
+.workbuddy/
+
+# 第三方站点的抓取样本，仅本地调试用（含第三方页面内容，不公开）
+javbus-probe/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+.idea/
+
+# 本地临时产物
+*.tmp
+*.bak
