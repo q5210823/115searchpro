@@ -10,6 +10,8 @@
 import { ensureHost, toast } from './ui.js';
 // v1.3.1：资料库列表改分批渲染（懒加载），窗口计算是纯函数、有单测
 import { LIB_PAGE_SIZE, libPageWindow, libFootText } from './paging.js';
+// v1.4.0：标题中译的展示规则（同样是纯函数、有单测）
+import { titleDisplayParts, GLOSSARY_VERSION, glossarySize } from './glossary.js';
 import {
   loadSettings,
   setSetting,
@@ -75,6 +77,7 @@ const PANEL_HTML = `
         <button class="btn" id="btnDumpDom">🧬 DOM 采样</button>
         <button class="btn" id="btnProbeLib">🔬 建库/播放入口探针</button>
         <button class="btn" id="btnSampleRow">🎬 采样视频行结构</button>
+        <button class="btn" id="btnTitleSample">🈶 译名对照（看哪条没译好）</button>
       </div>
 
       <div class="list" id="scanList" style="margin-top:12px"></div>
@@ -126,6 +129,7 @@ const PANEL_HTML = `
       <div class="lib-list" id="libList"></div>
 
       <div class="btnrow">
+        <button class="btn sm primary" id="btnTranslate" title="用本地术语表把日文标题译成中文（不联网、免费）">🌐 翻译标题</button>
         <button class="btn sm" id="btnLibClearFilter">清空筛选条件</button>
         <button class="btn sm" id="btnLibExport">导出资料库</button>
         <button class="btn sm" id="btnPurgeGone">🗑 清理失效条目</button>
@@ -218,6 +222,34 @@ const PANEL_HTML = `
       </div>
       <div class="row">
         <input type="text" class="grow" id="cfgPlayerUrl" placeholder="https://115.com/web/lixian/master/video/?pick_code={pickcode}&cid={cid}">
+      </div>
+
+      <div style="border-top:1px solid #eef0f3;margin:14px 0 12px"></div>
+      <div class="hint" style="margin-bottom:8px">
+        <b>标题中译</b>。用本地术语表把日文片名译成中文 ——
+        <b>不联网、不花钱、无内容审核问题</b>。
+      </div>
+      <div class="row">
+        <label style="width:96px">标题显示</label>
+        <select class="grow" id="cfgTitleDisplay">
+          <option value="zh-ja">中文主行 + 原文副行（推荐）</option>
+          <option value="zh">只显示中文</option>
+          <option value="ja">只显示原文</option>
+        </select>
+      </div>
+      <div class="row">
+        <label class="grow">查询后自动翻译新标题</label>
+        <input type="checkbox" id="cfgAutoTranslate" style="width:auto">
+      </div>
+      <div class="hint" style="margin:8px 0">
+        词典 <b id="cfgGlossaryVer">—</b>。
+        想提高命中率就编辑 <code>src/core/glossary.js</code> 的词条表，
+        再把 <code>GLOSSARY_VERSION</code> 加一后重新构建 ——
+        <b>已译条目会自动重译</b>（缓存哈希里含词典版本）。
+        哪些词没译到，点「数据/排障」里的<b>🈶 译名对照</b>一看便知。
+      </div>
+      <div class="row">
+        <button class="btn" id="btnRetranslate" style="width:100%">🔄 用当前词典全部重译</button>
       </div>
 
       <div class="btnrow">
@@ -423,6 +455,12 @@ export function createPanel(handlers = {}) {
     $('#cfgDmmAffId').value = cfg.dmmAffiliateId || '';
     $('#cfgPlayerUrl').value = cfg.playerUrlTemplate || DEFAULT_PLAYER_URL;
     $('#cfgPlayMode').value = cfg.playMode === 'inpage' ? 'inpage' : 'page';
+    // 标题中译
+    const modes = ['zh-ja', 'zh', 'ja'];
+    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh-ja';
+    $('#cfgAutoTranslate').checked = cfg.autoTranslateTitles !== false;
+    const gv = $('#cfgGlossaryVer');
+    if (gv) gv.textContent = `v${GLOSSARY_VERSION} · ${glossarySize()} 词条`;
   }
 
   $('#btnSaveCfg').addEventListener('click', async () => {
@@ -448,6 +486,10 @@ export function createPanel(handlers = {}) {
       await setSetting('playerUrlTemplate', playerUrl || DEFAULT_PLAYER_URL);
     }
     await setSetting('playMode', $('#cfgPlayMode').value === 'inpage' ? 'inpage' : 'page');
+    // 标题中译
+    const td = $('#cfgTitleDisplay').value;
+    await setSetting('titleDisplay', ['zh-ja', 'zh', 'ja'].includes(td) ? td : 'zh-ja');
+    await setSetting('autoTranslateTitles', $('#cfgAutoTranslate').checked);
     toast('设置已保存', 'ok');
     handlers.onSettingsChanged?.();
   });
@@ -543,7 +585,8 @@ export function createPanel(handlers = {}) {
    * 筛选是纯内存过滤：库里通常几百到几千条，直接遍历足够快，
    * 不需要为每个维度建查询计划。
    * ================================================================ */
-  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null };
+  // titleMode：标题显示方式，渲染前从设置里读一次（见 applyLibFilter）
+  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh-ja' };
 
   /** 重新从库里读一次，并刷新下拉筛选器 + 列表 */
   async function loadLibrary() {
@@ -745,6 +788,19 @@ export function createPanel(handlers = {}) {
     if (r.gone) badge = '<span class="badge bad">已失效</span>';
     else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
 
+    /*
+     * v1.4.0：中文标题作主行，原日文降为副行。
+     * 原文**不丢** —— 术语表翻译是机器产物，只当索引用，原文才是权威。
+     * 没有译文时老实退回原文（`titleDisplayParts` 里保证不留空白）。
+     */
+    const t = titleDisplayParts(r, libState.titleMode);
+    const zhBadge = t.badge
+      ? '<span class="badge tr" title="本地术语表翻译，非官方译名">译</span>'
+      : '';
+    const subLine = t.sub
+      ? `<div class="ttl-ja" title="原日文标题">${escapeHtml(t.sub)}</div>`
+      : '';
+
     const playTitle = r.pickcode
       ? '在新标签页打开播放页'
       : '这条记录没有提取码，点「收录本目录」补全后才能直接播放';
@@ -752,7 +808,8 @@ export function createPanel(handlers = {}) {
     return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
       <div class="mid">
         <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-        <div class="ttl" title="${escapeHtml(r.title || r.fileName)}">${escapeHtml(r.title || r.fileName)}</div>
+        <div class="ttl" title="${escapeHtml(t.main)}">${escapeHtml(t.main)}${zhBadge}</div>
+        ${subLine}
         <div class="tags">${tagLine}</div>
       </div>
       <div class="act">
@@ -843,6 +900,9 @@ export function createPanel(handlers = {}) {
         actresses: libState.actresses,
         genres: libState.genres
       });
+      // 每次渲染前读一次显示方式：用户在设置里改完，回到列表就能生效
+      const cfg = await loadSettings();
+      libState.titleMode = cfg.titleDisplay || 'zh-ja';
     } catch (e) {
       toast(`筛选失败：${e.message}`, 'err');
       return;
@@ -854,10 +914,16 @@ export function createPanel(handlers = {}) {
     // 缺提取码 = 点「播放」也开不了播放页的那批（收录一次即可补全）
     const noPc = rows.filter((r) => !r.pickcode && !r.gone).length;
     const filtered = rows.length !== total;
+    // 已译：有一定比例才报，免得全是 0 时刷屏
+    const translated = libState.facets ? (libState.facets.translated || 0) : 0;
+    const transTip = translated
+      ? ` · <span style="color:#2b5cff">已译 ${translated} 条</span>`
+      : '';
     $('#libStat').innerHTML =
       `资料库共 <b>${total}</b> 条` +
       (filtered ? ` · 当前筛选命中 <b style="color:#2b5cff">${rows.length}</b> 条` : '') +
       ` · 其中 ${tagged} 条有标签` +
+      transTip +
       (noPc ? ` · <span style="color:#a06a00">缺提取码 ${noPc} 条</span>` : '') +
       (gone ? ` · <span style="color:#c0322b">已失效 ${gone} 条</span>` : '');
     const pg = $('#btnPurgeGone');
@@ -915,6 +981,37 @@ export function createPanel(handlers = {}) {
       await deleteLibrary(id);
       toast(`已移除 ${row.code || row.fileName}`, 'ok');
       await loadLibrary();
+    }
+  });
+
+  /* ---- 标题中译（v1.4.0） ---- */
+  $('#btnTranslate').addEventListener('click', async () => {
+    const r = await handlers.onTranslateTitles?.();
+    // 译完立刻重跑一次筛选：列表读的是 library 里的副本，不重查就看不到新译文
+    await loadLibrary();
+    if (r && r.changed === 0 && r.total) {
+      api.setHint(`没有新的标题需要翻译（词典 v${GLOSSARY_VERSION}）。`
+        + '如果标题还是日文，用「🈶 译名对照」看看哪些词没收录。');
+    }
+  });
+
+  $('#btnRetranslate').addEventListener('click', async () => {
+    const r = await handlers.onRetranslateTitles?.();
+    await loadLibrary();
+    if (r) api.setHint(`已按当前词典 v${GLOSSARY_VERSION} 重译 ${r.done} 条，其中 ${r.changed} 条有译文。`);
+  });
+
+  $('#btnTitleSample').addEventListener('click', async () => {
+    const text = await handlers.onTitleSample?.();
+    if (!text) { api.setHint('对照表生成失败，请看控制台'); return; }
+    console.log(text);
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('译名对照已复制到剪贴板', 'ok');
+      api.setHint('对照表已复制。最前面那批就是「词典里缺的词」，照着补词条即可。');
+    } catch (e) {
+      toast('复制失败（浏览器限制），已输出到控制台', 'err');
+      api.setHint('对照表请看控制台（F12）。');
     }
   });
 

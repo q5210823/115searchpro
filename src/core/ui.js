@@ -249,11 +249,18 @@ input:focus, select:focus { border-color: #2b5cff; }
 }
 .lib-item .badge.warn { background: #fff6e0; color: #a06a00; border: 1px solid #f2dfb0; }
 .lib-item .badge.bad  { background: #fdeceb; color: #c0322b; border: 1px solid #f5cdc9; }
+/* 标题主行：v1.4.0 起这里是**中文**（没译出时退回原文） */
 .lib-item .ttl {
-  font-size: 11.5px; color: #5c6470; margin-top: 2px; line-height: 1.45;
+  font-size: 12.5px; color: #1f2329; margin-top: 2px; line-height: 1.45;
   overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
+/* 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗 */
+.lib-item .ttl-ja {
+  font-size: 11px; color: #9aa3b2; margin-top: 1px; line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lib-item .badge.tr { background: #eef2ff; color: #2b5cff; border: 1px solid #ccd8ff; }
 .lib-item .tags {
   font-size: 11px; color: #8a94a6; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

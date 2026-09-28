@@ -261,6 +261,13 @@ export function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirI
     code: code || '',
     confidence: confidence ?? 0,
     title: src ? (src.title || '') : '',
+    /*
+     * 中文标题（术语表翻译）。跟 title 一样从元数据抄一份到条目上 ——
+     * 列表渲染读的是 library 记录，不抄的话译文要等下次收录才看得到。
+     * 翻译本身是按「番号」缓存在 meta 表里的，这里只是个副本。
+     */
+    titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
+    titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
     actresses: src ? cleanArr(src.actresses) : [],
     genres: src ? cleanArr(src.genres) : [],
     cover: src ? (src.cover || '') : '',
@@ -428,10 +435,63 @@ export async function getLibraryFacets() {
   return {
     total: all.length,
     gone,
+    // 已经有中文译名的条数（面板上显示「已译 N 条」，让用户知道进度）
+    translated: all.filter((r) => r.titleZh).length,
     actresses: tally((r) => r.actresses || []),
     genres: tally((r) => r.genres || []),
     cids: tally((r) => (r.cid ? [r.cid] : []))
   };
+}
+
+/**
+ * 把「番号 → 中文标题」写回 meta，并同步到所有引用它的资料库条目。
+ *
+ * 为什么必须同步两处：
+ *   - `meta` 是翻译的**存放处**（按番号缓存，同一部片只译一次）
+ *   - `library` 是列表**渲染时的数据源**（它存的是副本）
+ *   只写 meta 的话，列表里看不到译文，得重收一次目录才生效 —— 那个体验很差。
+ */
+export async function applyTitleZhBatch(entries) {
+  if (!entries || !entries.length) return { meta: 0, library: 0 };
+  const db = await openDB();
+  const byCode = new Map();
+  for (const e of entries) if (e && e.code) byCode.set(String(e.code), e);
+  if (!byCode.size) return { meta: 0, library: 0 };
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_META, STORE_LIBRARY], 'readwrite');
+    const metaStore = tx.objectStore(STORE_META);
+    const libStore = tx.objectStore(STORE_LIBRARY);
+    let metaHits = 0;
+    let libHits = 0;
+
+    // ① 元数据：按 code 取回来合并。取不到就跳过 —— 不凭空造记录
+    for (const [code, e] of byCode) {
+      const req = metaStore.get(code);
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (cur) { metaStore.put(Object.assign({}, cur, e)); metaHits++; }
+      };
+    }
+
+    // ② 资料库：把译文抄到每个同番号的条目上
+    const all = libStore.getAll();
+    all.onsuccess = () => {
+      for (const r of all.result || []) {
+        const e = byCode.get(String(r.code || ''));
+        if (!e) continue;
+        // 原文没变、译名也没变 → 不必写回（省 I/O）
+        if (r.titleZh === e.titleZh && r.titleHash === e.titleHash) continue;
+        libStore.put(Object.assign({}, r, {
+          titleZh: e.titleZh, titleSrc: e.titleSrc, titleHash: e.titleHash
+        }));
+        libHits++;
+      }
+    };
+
+    tx.oncomplete = () => resolve({ meta: metaHits, library: libHits });
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 /**
@@ -589,7 +649,20 @@ export const DEFAULT_SETTINGS = {
    */
   playMode: PLAY_MODES.PAGE,
   /** 「播放」按钮的地址模板，见文件上方 DEFAULT_PLAYER_URL 的说明 */
-  playerUrlTemplate: DEFAULT_PLAYER_URL
+  playerUrlTemplate: DEFAULT_PLAYER_URL,
+  /**
+   * 标题中译（见 core/glossary.js）。
+   * 纯本地术语表，不联网、不花钱、没有内容审核问题。
+   * 自动模式：每次查询元数据后顺手把新标题译掉，用户不用手动点。
+   */
+  autoTranslateTitles: true,
+  /**
+   * 资料库列表里标题怎么显示：
+   *   'zh-ja' 中文主行 + 原文副行（默认，原文不丢）
+   *   'zh'    只显示中文
+   *   'ja'    只显示原文
+   */
+  titleDisplay: 'zh-ja'
 };
 
 export async function loadSettings() {
