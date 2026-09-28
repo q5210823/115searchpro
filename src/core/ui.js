@@ -78,9 +78,26 @@ const STYLES = `
 }
 .tab.active { color: #2b5cff; border-bottom-color: #2b5cff; font-weight: 500; }
 
-.body { padding: 12px 14px; overflow-y: auto; flex: 1; }
+/*
+ * .body 是抽屉的内容区（flex column）。绝大多数页签内容超出时由它滚动；
+ * 但「资料库」页例外 —— 见下面的 #pane-library 规则。
+ */
+.body { padding: 12px 14px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; }
 .pane { display: none; }
-.pane.active { display: block; }
+.pane.active { display: block; flex-shrink: 0; }
+
+/*
+ * 资料库页：让列表吃满抽屉的剩余高度，滚动**只发生在列表内部**。
+ *
+ * 为什么必须单独处理：旧版 .lib-list 被限死在 max-height 320px，
+ * 而外层 .body 又是个滚动容器 —— 两层嵌套滚动。43 条结果挤在巴掌大的
+ * 窗口里滚，用户看到的就是「筛选完显示不全，也没有翻页」。
+ * flex: 1 1 auto + min-height: 0 是让它在抽屉高度内收缩的关键。
+ */
+#pane-library.active {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0;
+}
 
 .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .row label { color: #5c6470; font-size: 12.5px; flex-shrink: 0; }
@@ -209,7 +226,14 @@ input:focus, select:focus { border-color: #2b5cff; }
 .dd-foot button.primary { background: #2b5cff; border-color: #2b5cff; color: #fff; }
 .dd-foot button.primary:hover { background: #1e4ce0; }
 
-.lib-list { max-height: 320px; overflow-y: auto; border: 1px solid #eef0f3; border-radius: 8px; }
+/*
+ * 列表区：吃满资料库页的剩余高度（原来写死 max-height: 320px）。
+ * min-height 兜底，避免抽屉很矮时列表被压成一条缝。
+ */
+.lib-list {
+  flex: 1 1 auto; min-height: 180px; overflow-y: auto;
+  border: 1px solid #eef0f3; border-radius: 8px;
+}
 .lib-item {
   padding: 8px 10px; border-bottom: 1px solid #f5f6f8;
   display: flex; gap: 9px; align-items: flex-start;
@@ -237,6 +261,15 @@ input:focus, select:focus { border-color: #2b5cff; }
 .lib-item .tags b { color: #2b5cff; font-weight: 500; }
 .lib-item .act { flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; }
 .lib-empty { text-align: center; color: #a8b0bd; padding: 30px 0; font-size: 12.5px; }
+/*
+ * 列表底部状态行。作用不只是好看 —— 它要明确告诉用户
+ * 「已显示 X / 共 Y 条」，加载完则写「已全部显示」。
+ * 少了这句，用户滚到底没看到新内容，仍会怀疑「是不是还有没加载出来的」。
+ */
+.lib-foot {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 8px; font-size: 11.5px; color: #a8b0bd; text-align: center;
+}
 `;
 
 /* ==================================================================

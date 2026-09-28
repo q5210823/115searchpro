@@ -14,7 +14,7 @@ const ROOT = path.dirname(__filename);
 const SRC = path.join(ROOT, 'src');
 const DIST = path.join(ROOT, 'dist');
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 
 /** 依赖顺序（被依赖的放前面） */
 const MODULE_ORDER = [
@@ -22,6 +22,7 @@ const MODULE_ORDER = [
   'core/tag-extractor.js',
   'core/providers.js',
   'core/storage.js',
+  'core/paging.js',      // 资料库列表分批渲染（v1.3.1）
   'core/ui.js',
   'core/site-115.js',
   'core/panel.js',

@@ -225,13 +225,80 @@ https://115.com/web/lixian/master/video/?pick_code={pickcode}&cid={cid}
 
 `actresses` / `genres` 建了 **multiEntry 索引**，所以「按某个演员查全部作品」可以直接走索引。
 不过当前筛选是在内存里做的（`filterLibraryRows`，纯函数、好测）—— 库规模到万级再考虑改用索引游标。
+渲染侧则分批进行，见下一节。
 
 > `DB_VERSION` 从 2 升到 3 时新增了 `dirs` 表。建表一律用 `contains` 包住，
 > **绝不 drop 旧表**，否则用户数据会被清空。
 
 ---
 
-## 五、历史设计：小圆点（已弃用）
+## 五、资料库列表：分批渲染（懒加载）
+
+### 问题不是「渲染不出来」，而是「没说清还有多少」
+
+v1.3.0 之前的实现是：
+
+```js
+list.innerHTML = rows.slice(0, 300).map(/* … */).join('');
+```
+
+两个毛病叠在一起：
+
+1. **静默截断**：命中 3869 条时只渲染 300 条，界面上**没有任何提示**
+   说明「还有 3539 条没显示」。用户只会觉得「筛选完显示不全」。
+2. **两层嵌套滚动**：`.lib-list` 写死 `max-height: 320px; overflow-y: auto`，
+   而外层 `.body` 也是 `overflow-y: auto` —— 43 条结果挤在 320px 的窗口里滚，
+   手感很差，滚到边界后会不会接力滚外层还得看浏览器实现。
+
+用户的原话是「发现不能显示全部结果，也没有翻页功能」。所以真正缺的并不是
+「翻页控件」，而是**分批加载 + 明确的总数反馈**。
+
+### 改法
+
+`core/paging.js`（纯计算，可单测）+ `panel.js`（只管 DOM）：
+
+| 成员 | 职责 |
+|---|---|
+| `LIB_PAGE_SIZE` | 每批 50 条 |
+| `libPageWindow(total, shown, size)` | 算出 `[from, to)` 窗口、本批条数、是否还有更多 |
+| `libFootText(total, shown, loading)` | 底部状态文案 |
+
+渲染侧：
+
+- `renderLibList()` 只渲染第一批，并在列表末尾放一个 `.lib-foot` 哨兵；
+- `IntersectionObserver` 盯着哨兵（`root` 指向列表本身，
+  `rootMargin: '0px 0px 160px 0px'` 提前 160px 触发），一进入视口就追加下一批；
+- 底部恒显「已显示 X / 共 Y 条 · 继续下滑自动加载」，
+  **加载完改写成「已全部显示（共 Y 条）」** —— 这句是关键：
+  少了它，用户滚到底没等到新内容，仍会怀疑「是不是还有没加载出来的」；
+- 观察器不可用时退化成「加载更多」按钮，不静默失败。
+
+### 布局：让滚动只发生在一处
+
+```css
+.body { display: flex; flex-direction: column; }   /* 内容区变 flex 容器 */
+#pane-library.active {                             /* 资料库页吃满剩余高度 */
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0;                   /* 关键：允许收缩 */
+}
+.lib-list { flex: 1 1 auto; min-height: 180px; }    /* 原来是 max-height: 320px */
+```
+
+`min-height: 0` 是 flex 滚动区的必要条件 —— flex item 默认 `min-height: auto`，
+不会收缩到比内容更小，于是列表永远撑破容器、无法内部滚动。
+
+### 边界要钉死在测试里
+
+- **窗口遍历不重不漏**：一直滚到底，所有下标必须恰好覆盖一次；
+- **非法 `size` 不能退化成 1**：`Math.max(1, size || DEFAULT)` 是错的 ——
+  负数是 truthy，会被 `max` 抬成 1，变成「一次只加载一条」。
+  `tests/test_paging.mjs` 里专门有一例钉这个；
+- **输入不能产生 NaN**：`slice(NaN, NaN)` 不报错、直接返回空数组，
+  表现是「列表一片空白但控制台干净」—— 最难查的一类 bug。
+
+---
+
+## 六、历史设计：小圆点（已弃用）
 
 > 以下内容记录 v1.1.x 的旧方案，**v1.2.0 已不再使用**。
 > 保留是为了排障时对照，以及说明为什么某些代码看起来「没人调用」。
@@ -268,9 +335,9 @@ SONE-119.mp4  ●          ← 平时就是这样
 含圆点的祖先，会越过本行命中整个列表容器，把此前所有行渲染好的圆点全清掉。
 现在改成：向上逐层清，**一旦遇到挂着其它文件名的容器就立刻停止**。
 
-—
+---
 
-## 六、调试
+## 七、调试
 
 ### 面板自带的诊断按钮（推荐）
 
@@ -340,7 +407,7 @@ __jv115.dumpRawDom(3)        // 原始 DOM 采样（outerHTML 片段）
 
 ---
 
-## 七、开发
+## 八、开发
 
 ```
 src/
@@ -356,6 +423,7 @@ src/
                           dirs     每个收录过的目录的汇总（增量更新的依据）
                           settings 配置
     ui.js                 Shadow DOM 样式（含资料库）+ 历史标签渲染 + Toast
+    paging.js             资料库列表分批渲染的纯计算（窗口 / 底部文案）
     site-115.js           115 页面适配：
                             · DOM 扫描（文件名识别 + 跨 frame + 行属性挖掘）
                             · webapi 客户端（apiFetchDirAll，自动翻页）
@@ -373,6 +441,7 @@ tests/                    测试脚本（`node tests/run_all.mjs` 一把跑完�
   test_library.mjs        资料库：记录组装 + 搜索筛选 + 增量语义 + 表结构（62 例）
   test_api.mjs            115 接口层：分页（含 count 缺失的坑）+ 错误处理
   test_play.mjs           播放：方式迁移 / 模板填充 / 播放页识别 / 自检判据（38 例）
+  test_paging.mjs         资料库列表分批渲染：窗口计算 + 底部文案（27 例）
   test_render.mjs         历史标签渲染（31 例，仍保留）
   verify_bundle.mjs       产物完整性校验（关键函数是否存在）
 ```
@@ -416,7 +485,7 @@ node tests/test_frames.mjs     # frame 角色判定
 
 ---
 
-## 八、DMM（可选）
+## 九、DMM（可选）
 
 DMM 官方 API 返回的数据最结构化（含封面、简介），但需要免费申请
 `api_id` + `affiliate_id`。

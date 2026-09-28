@@ -8,6 +8,8 @@
  */
 
 import { ensureHost, toast } from './ui.js';
+// v1.3.1：资料库列表改分批渲染（懒加载），窗口计算是纯函数、有单测
+import { LIB_PAGE_SIZE, libPageWindow, libFootText } from './paging.js';
 import {
   loadSettings,
   setSetting,
@@ -719,42 +721,118 @@ export function createPanel(handlers = {}) {
   // 点面板其它地方 → 收起所有下拉
   $('#pane-library').addEventListener('click', () => closeAllDd());
 
+  /* ---- 资料库列表：分批渲染（懒加载） ----
+   * 命中几千条时一次性渲染会卡，更要命的是**用户看不见「下面还有多少」**：
+   * 旧实现是 `slice(0, 300)` 静默截断 —— 既不说被截断了、也没法继续看，
+   * 观感就是「筛选完显示不全，又没有翻页」。
+   * 现在：先渲染 50 条，滚到底部自动追加，底部常驻「已显示 X / 共 Y 条」。
+   * 窗口计算在 core/paging.js（纯函数、有单测），这里只管 DOM。
+   */
+  let libShown = 0;        // 已渲染条数
+  let libObserver = null;  // 底部哨兵观察器
+
+  function libItemHtml(r) {
+    const acts = (r.actresses || []).join('、');
+    const gens = (r.genres || []).join('、');
+    const tagLine = [acts ? `<b>${escapeHtml(acts)}</b>` : '', gens ? escapeHtml(gens) : '']
+      .filter(Boolean)
+      .join(' · ') || (r.matched ? '（无演员/类别信息）' : '未获取到标签');
+    /*
+     * 缺 pickcode 的记录开不了播放页（播放地址里 pick_code 是必填项）——
+     * 直接在列表里标出来，省得用户点一次被拒一次。
+     */
+    let badge = '';
+    if (r.gone) badge = '<span class="badge bad">已失效</span>';
+    else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
+
+    const playTitle = r.pickcode
+      ? '在新标签页打开播放页'
+      : '这条记录没有提取码，点「收录本目录」补全后才能直接播放';
+
+    return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
+      <div class="mid">
+        <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
+        <div class="ttl" title="${escapeHtml(r.title || r.fileName)}">${escapeHtml(r.title || r.fileName)}</div>
+        <div class="tags">${tagLine}</div>
+      </div>
+      <div class="act">
+        <button class="btn sm primary" data-act="play" title="${escapeHtml(playTitle)}">▶ 播放</button>
+        <button class="btn sm" data-act="del">移除</button>
+      </div>
+    </div>`;
+  }
+
+  /** 刷新底部状态行（含「加载更多」兜底按钮） */
+  function renderLibFoot() {
+    const list = $('#libList');
+    const total = libState.rows.length;
+    let foot = $('#libFoot');
+    if (!foot) {
+      list.insertAdjacentHTML('beforeend', '<div class="lib-foot" id="libFoot"></div>');
+      foot = $('#libFoot');
+    }
+    const txt = libFootText(total, libShown);
+    const more = libShown < total;
+    foot.innerHTML =
+      (txt ? `<span>${escapeHtml(txt)}</span>` : '') +
+      // 兜底：IntersectionObserver 不可用（或没触发）时，用户也能手动继续
+      (more ? '<button class="btn sm" data-act="more">加载更多</button>' : '');
+  }
+
+  /** 追加下一批；返回是否还有剩余 */
+  function appendLibChunk() {
+    const list = $('#libList');
+    const rows = libState.rows;
+    const w = libPageWindow(rows.length, libShown, LIB_PAGE_SIZE);
+    if (w.added > 0) {
+      const html = rows.slice(w.from, w.to).map(libItemHtml).join('');
+      const foot = $('#libFoot');
+      // 新内容插在 footer 之前，footer 始终垫底
+      if (foot) foot.insertAdjacentHTML('beforebegin', html);
+      else list.insertAdjacentHTML('beforeend', html);
+      libShown = w.to;
+    }
+    renderLibFoot();
+    return w.hasMore;
+  }
+
+  /** 盯住底部 footer：进入视口就自动追加下一批 */
+  function armLibObserver() {
+    if (libObserver) { libObserver.disconnect(); libObserver = null; }
+    if (typeof IntersectionObserver !== 'function') return;   // 老浏览器走「加载更多」按钮
+    const list = $('#libList');
+    const foot = $('#libFoot');
+    if (!foot) return;
+    libObserver = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      if (libShown >= libState.rows.length) {
+        libObserver?.disconnect();
+        return;
+      }
+      appendLibChunk();
+      // ⚠️ 追加后 footer 被顶下去，但元素本身没变，无需重新 observe
+    }, {
+      root: list,
+      // 提前 160px 开始加载，滚动更连贯（不会看到明显的「转圈」）
+      rootMargin: '0px 0px 160px 0px',
+      threshold: 0
+    });
+    libObserver.observe(foot);
+  }
+
   function renderLibList(rows) {
     const list = $('#libList');
+    if (libObserver) { libObserver.disconnect(); libObserver = null; }
+    libState.rows = rows;      // 与调用方保持一致（applyLibFilter 也会赋值）
+    libShown = 0;
     if (!rows.length) {
       list.innerHTML = '<div class="lib-empty">没有匹配的条目</div>';
       return;
     }
-    list.innerHTML = rows.slice(0, 300).map((r) => {
-      const acts = (r.actresses || []).join('、');
-      const gens = (r.genres || []).join('、');
-      const tagLine = [acts ? `<b>${escapeHtml(acts)}</b>` : '', gens ? escapeHtml(gens) : '']
-        .filter(Boolean)
-        .join(' · ') || (r.matched ? '（无演员/类别信息）' : '未获取到标签');
-      /*
-       * 缺 pickcode 的记录开不了播放页（播放地址里 pick_code 是必填项）——
-       * 直接在列表里标出来，省得用户点一次被拒一次。
-       */
-      let badge = '';
-      if (r.gone) badge = '<span class="badge bad">已失效</span>';
-      else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
-
-      const playTitle = r.pickcode
-        ? '在新标签页打开播放页'
-        : '这条记录没有提取码，点「收录本目录」补全后才能直接播放';
-
-      return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
-        <div class="mid">
-          <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-          <div class="ttl" title="${escapeHtml(r.title || r.fileName)}">${escapeHtml(r.title || r.fileName)}</div>
-          <div class="tags">${tagLine}</div>
-        </div>
-        <div class="act">
-          <button class="btn sm primary" data-act="play" title="${escapeHtml(playTitle)}">▶ 播放</button>
-          <button class="btn sm" data-act="del">移除</button>
-        </div>
-      </div>`;
-    }).join('');
+    list.innerHTML = '';       // 清掉上一轮内容（含旧 footer）
+    appendLibChunk();          // 第一批 50 条（内部会建 footer）
+    armLibObserver();
+    list.scrollTop = 0;        // 换了筛选条件 → 列表回到顶部
   }
 
   async function applyLibFilter() {
@@ -819,6 +897,13 @@ export function createPanel(handlers = {}) {
   $('#libList').addEventListener('click', async (ev) => {
     const btn = ev.target.closest?.('button[data-act]');
     if (!btn) return;
+
+    // 「加载更多」不属于任何条目（在 footer 里），先单独处理
+    if (btn.dataset.act === 'more') {
+      appendLibChunk();
+      return;
+    }
+
     const itemEl = btn.closest('.lib-item');
     const id = itemEl?.dataset.id;
     const row = libState.rows.find((r) => r.id === id);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         115 网盘 JAV 标签助手
 // @namespace    https://github.com/jv115-tagger
-// @version      1.3.0
+// @version      1.3.1
 // @description  读取 115 网盘视频文件名，自动提取番号，从 JavBus / javlibrary 拉取影片信息，在文件列表上以「标题+演员+类别」标签形式展示。纯本地标签库，不改动 115 任何原始文件，无需 API key。
 // @author       jv115-tagger
 // @match        *://*.115.com/*
@@ -1573,6 +1573,80 @@ async function getStats() {
 
 
 /* ==================================================================
+ * core/paging.js
+ * ================================================================== */
+
+/**
+ * 资料库列表的分批渲染（懒加载）
+ * ------------------------------------------------------------------
+ * 为什么需要它：
+ *   命中几千条时一次性塞进 DOM 会卡；更要命的是**用户看不见「下面还有多少」** ——
+ *   旧实现是 `rows.slice(0, 300)` 静默截断，既不说截断了、也没法继续看，
+ *   观感就是「筛选完显示不全，也没有翻页」。
+ *
+ * 现在的做法：
+ *   · 先渲染前 LIB_PAGE_SIZE 条；
+ *   · 滚到底部（footer 进入视口）自动追加下一批；
+ *   · 底部常驻一行状态，写明「已显示 X / 共 Y 条」或「已全部显示」。
+ *
+ * 这里只放**纯计算**（方便单测）；DOM 操作在 panel.js 里。
+ * ⚠️ 打包器把所有模块拼进同一作用域，常量名全局唯一。
+ */
+
+/** 每批渲染多少条（用户要求：默认显示 50 条） */
+const LIB_PAGE_SIZE = 50;
+
+/**
+ * 算出下一批要渲染的区间。
+ *
+ * @param {number} total 本次筛选命中的总条数
+ * @param {number} shown 已经渲染了多少条
+ * @param {number} [size] 每批条数
+ * @returns {{from:number, to:number, added:number, hasMore:boolean}}
+ *          from/to 为 [from, to) 左闭右开区间；added 是本批新增条数
+ */
+function libPageWindow(total, shown, size = LIB_PAGE_SIZE) {
+  // 容错：任何非数字/负数/越界的输入都要夹到合法区间，绝不能算出 NaN 让 slice 静默返回空数组
+  const t = Math.max(0, Math.floor(Number(total)) || 0);
+  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
+
+  /*
+   * size 非法（NaN / 0 / 负数）一律**回落默认值**。
+   * ⚠️ 不能写成 `Math.max(1, size || DEFAULT)`：负数是 truthy，
+   *    会被 max 抬成 1 —— 退化成「一次一条」，比报错还难发现。
+   */
+  const rawStep = Math.floor(Number(size));
+  const step = Number.isFinite(rawStep) && rawStep > 0 ? rawStep : LIB_PAGE_SIZE;
+
+  const from = s;
+  const to = Math.min(from + step, t);
+  return { from, to, added: to - from, hasMore: to < t };
+}
+
+/**
+ * 底部状态行文案。
+ *
+ * 关键点：**加载完必须明确说「已全部显示」**。
+ * 否则用户滚到底看到没有新内容，仍会怀疑「是不是还有没加载出来的」——
+ * 这正是这次要修的观感问题。
+ *
+ * @param {number} total 命中总数
+ * @param {number} shown 已渲染条数
+ * @param {boolean} [loading] 是否正在加载
+ * @returns {string} 空串表示不需要 footer
+ */
+function libFootText(total, shown, loading = false) {
+  const t = Math.max(0, Math.floor(Number(total)) || 0);
+  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
+
+  if (t === 0) return '';
+  if (loading) return `正在加载… 已显示 ${s} / ${t} 条`;
+  if (s >= t) return `已全部显示（共 ${t} 条）`;
+  return `已显示 ${s} / 共 ${t} 条 · 继续下滑自动加载`;
+}
+
+
+/* ==================================================================
  * core/ui.js
  * ================================================================== */
 
@@ -1656,9 +1730,26 @@ const STYLES = `
 }
 .tab.active { color: #2b5cff; border-bottom-color: #2b5cff; font-weight: 500; }
 
-.body { padding: 12px 14px; overflow-y: auto; flex: 1; }
+/*
+ * .body 是抽屉的内容区（flex column）。绝大多数页签内容超出时由它滚动；
+ * 但「资料库」页例外 —— 见下面的 #pane-library 规则。
+ */
+.body { padding: 12px 14px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; }
 .pane { display: none; }
-.pane.active { display: block; }
+.pane.active { display: block; flex-shrink: 0; }
+
+/*
+ * 资料库页：让列表吃满抽屉的剩余高度，滚动**只发生在列表内部**。
+ *
+ * 为什么必须单独处理：旧版 .lib-list 被限死在 max-height 320px，
+ * 而外层 .body 又是个滚动容器 —— 两层嵌套滚动。43 条结果挤在巴掌大的
+ * 窗口里滚，用户看到的就是「筛选完显示不全，也没有翻页」。
+ * flex: 1 1 auto + min-height: 0 是让它在抽屉高度内收缩的关键。
+ */
+#pane-library.active {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0;
+}
 
 .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .row label { color: #5c6470; font-size: 12.5px; flex-shrink: 0; }
@@ -1787,7 +1878,14 @@ input:focus, select:focus { border-color: #2b5cff; }
 .dd-foot button.primary { background: #2b5cff; border-color: #2b5cff; color: #fff; }
 .dd-foot button.primary:hover { background: #1e4ce0; }
 
-.lib-list { max-height: 320px; overflow-y: auto; border: 1px solid #eef0f3; border-radius: 8px; }
+/*
+ * 列表区：吃满资料库页的剩余高度（原来写死 max-height: 320px）。
+ * min-height 兜底，避免抽屉很矮时列表被压成一条缝。
+ */
+.lib-list {
+  flex: 1 1 auto; min-height: 180px; overflow-y: auto;
+  border: 1px solid #eef0f3; border-radius: 8px;
+}
 .lib-item {
   padding: 8px 10px; border-bottom: 1px solid #f5f6f8;
   display: flex; gap: 9px; align-items: flex-start;
@@ -1815,6 +1913,15 @@ input:focus, select:focus { border-color: #2b5cff; }
 .lib-item .tags b { color: #2b5cff; font-weight: 500; }
 .lib-item .act { flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; }
 .lib-empty { text-align: center; color: #a8b0bd; padding: 30px 0; font-size: 12.5px; }
+/*
+ * 列表底部状态行。作用不只是好看 —— 它要明确告诉用户
+ * 「已显示 X / 共 Y 条」，加载完则写「已全部显示」。
+ * 少了这句，用户滚到底没看到新内容，仍会怀疑「是不是还有没加载出来的」。
+ */
+.lib-foot {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 8px; font-size: 11.5px; color: #a8b0bd; text-align: center;
+}
 `;
 
 /* ==================================================================
@@ -4306,6 +4413,8 @@ if (typeof window !== 'undefined') {
  *   数据   本地库统计、导出/导入、清理
  */
 
+// v1.3.1：资料库列表改分批渲染（懒加载），窗口计算是纯函数、有单测
+
 
 const PANEL_HTML = `
 <button class="fab" id="fab" title="JAV 标签助手">标签</button>
@@ -5004,42 +5113,118 @@ function createPanel(handlers = {}) {
   // 点面板其它地方 → 收起所有下拉
   $('#pane-library').addEventListener('click', () => closeAllDd());
 
+  /* ---- 资料库列表：分批渲染（懒加载） ----
+   * 命中几千条时一次性渲染会卡，更要命的是**用户看不见「下面还有多少」**：
+   * 旧实现是 `slice(0, 300)` 静默截断 —— 既不说被截断了、也没法继续看，
+   * 观感就是「筛选完显示不全，又没有翻页」。
+   * 现在：先渲染 50 条，滚到底部自动追加，底部常驻「已显示 X / 共 Y 条」。
+   * 窗口计算在 core/paging.js（纯函数、有单测），这里只管 DOM。
+   */
+  let libShown = 0;        // 已渲染条数
+  let libObserver = null;  // 底部哨兵观察器
+
+  function libItemHtml(r) {
+    const acts = (r.actresses || []).join('、');
+    const gens = (r.genres || []).join('、');
+    const tagLine = [acts ? `<b>${escapeHtml(acts)}</b>` : '', gens ? escapeHtml(gens) : '']
+      .filter(Boolean)
+      .join(' · ') || (r.matched ? '（无演员/类别信息）' : '未获取到标签');
+    /*
+     * 缺 pickcode 的记录开不了播放页（播放地址里 pick_code 是必填项）——
+     * 直接在列表里标出来，省得用户点一次被拒一次。
+     */
+    let badge = '';
+    if (r.gone) badge = '<span class="badge bad">已失效</span>';
+    else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
+
+    const playTitle = r.pickcode
+      ? '在新标签页打开播放页'
+      : '这条记录没有提取码，点「收录本目录」补全后才能直接播放';
+
+    return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
+      <div class="mid">
+        <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
+        <div class="ttl" title="${escapeHtml(r.title || r.fileName)}">${escapeHtml(r.title || r.fileName)}</div>
+        <div class="tags">${tagLine}</div>
+      </div>
+      <div class="act">
+        <button class="btn sm primary" data-act="play" title="${escapeHtml(playTitle)}">▶ 播放</button>
+        <button class="btn sm" data-act="del">移除</button>
+      </div>
+    </div>`;
+  }
+
+  /** 刷新底部状态行（含「加载更多」兜底按钮） */
+  function renderLibFoot() {
+    const list = $('#libList');
+    const total = libState.rows.length;
+    let foot = $('#libFoot');
+    if (!foot) {
+      list.insertAdjacentHTML('beforeend', '<div class="lib-foot" id="libFoot"></div>');
+      foot = $('#libFoot');
+    }
+    const txt = libFootText(total, libShown);
+    const more = libShown < total;
+    foot.innerHTML =
+      (txt ? `<span>${escapeHtml(txt)}</span>` : '') +
+      // 兜底：IntersectionObserver 不可用（或没触发）时，用户也能手动继续
+      (more ? '<button class="btn sm" data-act="more">加载更多</button>' : '');
+  }
+
+  /** 追加下一批；返回是否还有剩余 */
+  function appendLibChunk() {
+    const list = $('#libList');
+    const rows = libState.rows;
+    const w = libPageWindow(rows.length, libShown, LIB_PAGE_SIZE);
+    if (w.added > 0) {
+      const html = rows.slice(w.from, w.to).map(libItemHtml).join('');
+      const foot = $('#libFoot');
+      // 新内容插在 footer 之前，footer 始终垫底
+      if (foot) foot.insertAdjacentHTML('beforebegin', html);
+      else list.insertAdjacentHTML('beforeend', html);
+      libShown = w.to;
+    }
+    renderLibFoot();
+    return w.hasMore;
+  }
+
+  /** 盯住底部 footer：进入视口就自动追加下一批 */
+  function armLibObserver() {
+    if (libObserver) { libObserver.disconnect(); libObserver = null; }
+    if (typeof IntersectionObserver !== 'function') return;   // 老浏览器走「加载更多」按钮
+    const list = $('#libList');
+    const foot = $('#libFoot');
+    if (!foot) return;
+    libObserver = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      if (libShown >= libState.rows.length) {
+        libObserver?.disconnect();
+        return;
+      }
+      appendLibChunk();
+      // ⚠️ 追加后 footer 被顶下去，但元素本身没变，无需重新 observe
+    }, {
+      root: list,
+      // 提前 160px 开始加载，滚动更连贯（不会看到明显的「转圈」）
+      rootMargin: '0px 0px 160px 0px',
+      threshold: 0
+    });
+    libObserver.observe(foot);
+  }
+
   function renderLibList(rows) {
     const list = $('#libList');
+    if (libObserver) { libObserver.disconnect(); libObserver = null; }
+    libState.rows = rows;      // 与调用方保持一致（applyLibFilter 也会赋值）
+    libShown = 0;
     if (!rows.length) {
       list.innerHTML = '<div class="lib-empty">没有匹配的条目</div>';
       return;
     }
-    list.innerHTML = rows.slice(0, 300).map((r) => {
-      const acts = (r.actresses || []).join('、');
-      const gens = (r.genres || []).join('、');
-      const tagLine = [acts ? `<b>${escapeHtml(acts)}</b>` : '', gens ? escapeHtml(gens) : '']
-        .filter(Boolean)
-        .join(' · ') || (r.matched ? '（无演员/类别信息）' : '未获取到标签');
-      /*
-       * 缺 pickcode 的记录开不了播放页（播放地址里 pick_code 是必填项）——
-       * 直接在列表里标出来，省得用户点一次被拒一次。
-       */
-      let badge = '';
-      if (r.gone) badge = '<span class="badge bad">已失效</span>';
-      else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
-
-      const playTitle = r.pickcode
-        ? '在新标签页打开播放页'
-        : '这条记录没有提取码，点「收录本目录」补全后才能直接播放';
-
-      return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
-        <div class="mid">
-          <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-          <div class="ttl" title="${escapeHtml(r.title || r.fileName)}">${escapeHtml(r.title || r.fileName)}</div>
-          <div class="tags">${tagLine}</div>
-        </div>
-        <div class="act">
-          <button class="btn sm primary" data-act="play" title="${escapeHtml(playTitle)}">▶ 播放</button>
-          <button class="btn sm" data-act="del">移除</button>
-        </div>
-      </div>`;
-    }).join('');
+    list.innerHTML = '';       // 清掉上一轮内容（含旧 footer）
+    appendLibChunk();          // 第一批 50 条（内部会建 footer）
+    armLibObserver();
+    list.scrollTop = 0;        // 换了筛选条件 → 列表回到顶部
   }
 
   async function applyLibFilter() {
@@ -5104,6 +5289,13 @@ function createPanel(handlers = {}) {
   $('#libList').addEventListener('click', async (ev) => {
     const btn = ev.target.closest?.('button[data-act]');
     if (!btn) return;
+
+    // 「加载更多」不属于任何条目（在 footer 里），先单独处理
+    if (btn.dataset.act === 'more') {
+      appendLibChunk();
+      return;
+    }
+
     const itemEl = btn.closest('.lib-item');
     const id = itemEl?.dataset.id;
     const row = libState.rows.find((r) => r.id === id);
