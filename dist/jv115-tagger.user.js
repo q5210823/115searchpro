@@ -9,6 +9,8 @@
 // @match        *://*.115vod.com/*
 // @include      *://*.115.com/*
 // @include      *://*.115cdn.com/*
+// @updateURL    https://raw.githubusercontent.com/q5210823/115searchpro/main/dist/jv115-tagger.user.js
+// @downloadURL  https://raw.githubusercontent.com/q5210823/115searchpro/main/dist/jv115-tagger.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue

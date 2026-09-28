@@ -179,6 +179,9 @@ https://github.com/q5210823/115searchpro/raw/main/dist/jv115-tagger.user.js
 1. 打开 [`dist/jv115-tagger.user.js`](dist/jv115-tagger.user.js)，全选复制
 2. Tampermonkey 面板 → **添加新脚本** → 粘贴覆盖 → `Ctrl+S` 保存
 
+> **装一次就够了**：脚本已声明 `@updateURL` / `@downloadURL`，
+> 以后本仓库更新版本时，Tampermonkey 会自动检查并提示升级，不用回来手动重装。
+>
 > 首次安装后，Tampermonkey 可能提示授权跨域请求，选择「**总是允许**」。
 
 ### 3. 验证
