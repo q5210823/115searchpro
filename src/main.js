@@ -44,7 +44,8 @@ import {
   translateTitle,
   hashTitle,
   GLOSSARY_VERSION,
-  glossarySize
+  glossarySize,
+  FULL_COVERAGE
 } from './core/glossary.js';
 // 注意：不再 import renderTagPill —— 蓝点/悬停方案已弃用，
 // 标签统一展示在面板的「资料库」页签里。
@@ -532,20 +533,31 @@ async function translateTitles(force = false, { silent = false } = {}) {
   const entries = [];
   let changed = 0;
   let missed = 0;
+  let full = 0;
 
   for (let i = 0; i < todo.length; i++) {
     const m = todo[i];
     const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
+    /*
+     * 只要有一处改动就存译文 —— 这是有意的：
+     * 半译总比不译强，用户至少能认出「同窓会」是「同窗会」。
+     * 但**必须同时存覆盖率**，否则界面上分不出「译得动」和「只译到一两个词」，
+     * 一条 56% 的标题会和完整译名长得一模一样。
+     */
     entries.push({
       code: m.code,
       // 没译出来就存空串，让列表老实回退到原文，而不是存一份和原文一样的「译文」
       titleZh: r.changed ? r.zh : '',
       titleSrc: r.changed ? 'glossary' : '',
+      titleCoverage: r.changed ? Math.round(r.coverage * 1000) / 1000 : 0,
       // ★ 没命中也要记哈希：否则每次都会把同一批「没命中」的条目重新算一遍
       titleHash: hashTitle(m.title),
       titleZhAt: Date.now()
     });
-    if (r.changed) changed++; else missed++;
+    if (r.changed) {
+      changed++;
+      if (r.coverage >= FULL_COVERAGE) full++;
+    } else missed++;
     if (i % 200 === 199) {
       if (!silent) panel?.setProgress(i + 1, todo.length);
       // 让出主线程：几千条时不能把页面卡死
@@ -556,19 +568,27 @@ async function translateTitles(force = false, { silent = false } = {}) {
   await applyTitleZhBatch(entries);
   broadcast('render-cache');
 
-  const msg = `✅ 标题中译：${changed} 条译出 · ${missed} 条未命中（保留原文）`
+  /*
+   * 报数要如实：只说「N 条译出」会让人以为有 N 条可用，
+   * 实际其中不少只译到一两个词。所以把「译得动」单独拎出来说。
+   */
+  const part = changed - full;
+  const msg = `✅ 标题中译：${full} 条译得动 · ${part} 条只译到一部分 · ${missed} 条未命中`
     + ` · 词典 v${GLOSSARY_VERSION}（${glossarySize()} 词条）`;
   if (silent) {
     panel?.setHint(msg);
   } else {
     panel?.setBusy(false, msg);
-    panel?.setHint(missed
-      ? '未命中的那批会原样显示日文标题。想提高命中率：把常用词补进 core/glossary.js 的词典表，'
-        + '把 GLOSSARY_VERSION +1 后重新构建即可 —— 已译条目会自动重译。'
-      : '全部译出，没有残留日文。');
-    toast(`标题中译完成：${changed} 条`, 'ok');
+    panel?.setHint(
+      part || missed
+        ? '术语表是「词对词替换」，长句里剩下的动词活用和助词它翻不掉，'
+          + '所以会有「一半中文一半日文」的条目 —— 这是纯本地方案的天花板，不是没生效。'
+          + '想提高覆盖率：把常用词补进 core/glossary.js，把 GLOSSARY_VERSION +1 后重新构建，已译条目会自动重译。'
+        : '全部译出，没有残留日文。'
+    );
+    toast(`标题中译完成：${full} 条译得动 · ${part} 条半译`, 'ok');
   }
-  return { total: withTitle.length, done: todo.length, changed, missed };
+  return { total: withTitle.length, done: todo.length, changed, full, missed };
 }
 
 /**

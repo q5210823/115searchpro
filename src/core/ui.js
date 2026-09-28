@@ -255,12 +255,18 @@ input:focus, select:focus { border-color: #2b5cff; }
   overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
-/* 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗 */
+/*
+ * 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗。
+ * v1.4.1 起默认不再显示这一行（原文改到鼠标悬停），只有把显示方式切成
+ * 「中文一行 + 原文一行」时才用得上。
+ */
 .lib-item .ttl-ja {
   font-size: 11px; color: #9aa3b2; margin-top: 1px; line-height: 1.4;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 「译」= 这份译文基本能读；「半」= 只译到一部分，剩下的还是日文 */
 .lib-item .badge.tr { background: #eef2ff; color: #2b5cff; border: 1px solid #ccd8ff; }
+.lib-item .badge.tr.half { background: #fdf6e8; color: #8a6d3b; border-color: #f0e0c0; }
 .lib-item .tags {
   font-size: 11px; color: #8a94a6; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

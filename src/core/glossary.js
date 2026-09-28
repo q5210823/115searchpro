@@ -38,8 +38,23 @@
  * ★ 只要改了下面的词条表，就必须把它 +1 ——
  *   翻译缓存用 `hash(原文 + 版本号)` 判断是否需要重译，
  *   不升版本的话，老条目的译文会一直停在旧规则上。
+ *
+ * v1 → v2：词条没动，但翻译结果里多存了「覆盖率」一项。
+ *   不升版本的话已译条目不会重算，界面就永远拿不到
+ *   「译得动 / 只译了一半」的区分。
  */
-export const GLOSSARY_VERSION = 1;
+export const GLOSSARY_VERSION = 2;
+
+/**
+ * 「译得动」的覆盖率门槛。
+ *
+ * ★ 为什么需要这个数：v1.4.0 只要译文与原文有**一个词**不同就标「译」，
+ *   于是一条只把「同窓会」换成「同窗会」、其余全是日文的标题也挂着「译」角标。
+ *   面板上于是显示「已译 3293 条」，用户看列表却觉得「大部分没生效」——
+ *   两边都没说谎，是指标本身没意义。
+ *   低于这个门槛的标「半」（只译到一部分），别冒充完整译名。
+ */
+export const FULL_COVERAGE = 0.75;
 
 /* ------------------------------------------------------------------
  * 1. 厂商 / 系列：日文写法 → 通用中文/官方写法
@@ -656,31 +671,49 @@ export function hashTitle(jaTitle) {
 }
 
 /* ------------------------------------------------------------------
- * 展示：中文主行 + 原文副行
+ * 展示：中文一行 + 原文放悬停
  * ------------------------------------------------------------------ */
 
 /**
  * 算出列表里该显示什么。
  *
- * @param {object} rec  资料库记录（用到 title / titleZh / titleSrc / fileName）
- * @param {string} mode 'zh-ja' 中文主行+原文副行（默认）/ 'zh' 只中文 / 'ja' 只原文
+ * ★ 默认只显示**一行中文**，原文放进 `hover`（鼠标悬停才看）。
+ *   早先默认是「中文主行 + 原文副行」两行，实测列表太挤、每条都占两行，
+ *   反而不好扫 —— 原文不是不用，是不该常驻占位。
+ *
+ * @param {object} rec  资料库记录（用到 title / titleZh / titleCoverage / titleSrc / fileName）
+ * @param {string} mode 'zh' 只中文（默认，原文放悬停）
+ *                      'zh-ja' 中文一行 + 原文一行（想看原文时再切）
+ *                      'ja' 只原文
+ * @returns {{main:string, sub:string, hover:string, badge:string, translated:boolean}}
+ *          badge: '' 无译文 / 'full' 译得动 / 'part' 只译到一部分
  */
-export function titleDisplayParts(rec, mode = 'zh-ja') {
+export function titleDisplayParts(rec, mode = 'zh') {
   const ja = String(rec?.title || '').trim();
   const zh = String(rec?.titleZh || '').trim();
   const fallback = String(rec?.fileName || '');
   const hasZh = !!zh && zh !== ja;
-  const badge = hasZh && rec?.titleSrc === 'glossary' ? '译' : '';
 
   if (mode === 'ja') {
-    return { main: ja || fallback, sub: '', badge: '', translated: false };
+    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
   }
   // 没有译文就老实显示原文，**不要留空白**
   if (!hasZh) {
-    return { main: ja || fallback, sub: '', badge: '', translated: false };
+    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
   }
-  if (mode === 'zh') {
-    return { main: zh, sub: '', badge, translated: true };
+
+  const hover = ja && ja !== zh ? ja : '';
+  /*
+   * 覆盖率缺失时（老记录、或从备份导入的）按「译得动」算 ——
+   * 宁可多标一个「译」，也不要给用户一堆没来由的「半」。
+   */
+  const cov = Number(rec?.titleCoverage);
+  const full = Number.isFinite(cov) ? cov >= FULL_COVERAGE : true;
+  // 只有术语表产出的译文才挂角标；将来若支持手工译名，手工的不该标成「机器译」
+  const badge = rec?.titleSrc === 'glossary' ? (full ? 'full' : 'part') : '';
+
+  if (mode === 'zh-ja') {
+    return { main: zh, sub: ja, hover, badge, translated: true };
   }
-  return { main: zh, sub: ja, badge, translated: true };
+  return { main: zh, sub: '', hover, badge, translated: true };
 }

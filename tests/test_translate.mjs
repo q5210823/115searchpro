@@ -8,7 +8,7 @@
  *   助词处理         —— の→的；其他助词要求左边紧邻中日文，词首不许被吞
  *   统计口径         —— 专名回填**之前**统计残留假名，否则 coverage 会虚低
  *   hashTitle        —— 必须把词典版本混进哈希（改词典才能自动重译）
- *   titleDisplayParts—— 中文主行 + 原文副行 + 「译」角标
+ *   titleDisplayParts—— 中文一行 + 原文放悬停 + 「译/半」角标
  *
  * 加载方式沿用其它测试：剥掉 export，用 new Function 注入。
  */
@@ -44,14 +44,14 @@ const mod = new Function(
   `"use strict";
    ${stripExports(SRC)}
    return { translateTitle, hashTitle, titleDisplayParts, glossarySize,
-            normalizeKanji, kanjiTableSize,
+            normalizeKanji, kanjiTableSize, FULL_COVERAGE,
             GLOSSARY, GLOSSARY_PARTICLES, GLOSSARY_VERSION };
   `
 )();
 
 const {
   translateTitle, hashTitle, titleDisplayParts, glossarySize,
-  normalizeKanji, kanjiTableSize,
+  normalizeKanji, kanjiTableSize, FULL_COVERAGE,
   GLOSSARY, GLOSSARY_PARTICLES, GLOSSARY_VERSION
 } = mod;
 
@@ -231,29 +231,42 @@ truthy('返回非空字符串', typeof hashTitle('X') === 'string' && hashTitle(
 truthy('词典版本参与哈希（改词典就能自动重译）', hashTitle('X') !== djb2('X'));
 
 /* ================================================================== */
-console.log('\n===== 6. titleDisplayParts（中文主行 + 原文副行） =====');
+console.log('\n===== 6. titleDisplayParts（中文一行 + 原文放悬停） =====');
 
-const rec = { title: '新人デビュー', titleZh: '新人出道', titleSrc: 'glossary' };
+const rec = { title: '新人デビュー', titleZh: '新人出道', titleSrc: 'glossary', titleCoverage: 0.9 };
 
-check('默认（中文主行 + 原文副行）',
-  titleDisplayParts(rec), { main: '新人出道', sub: '新人デビュー', badge: '译', translated: true });
+check('默认：只有中文一行，原文进 hover（不再占第二行）',
+  titleDisplayParts(rec),
+  { main: '新人出道', sub: '', hover: '新人デビュー', badge: 'full', translated: true });
 
-check("模式 'zh' 只显示中文",
-  titleDisplayParts(rec, 'zh'), { main: '新人出道', sub: '', badge: '译', translated: true });
+check("模式 'zh-ja'：中文一行 + 原文一行（想看原文时常驻）",
+  titleDisplayParts(rec, 'zh-ja'),
+  { main: '新人出道', sub: '新人デビュー', hover: '新人デビュー', badge: 'full', translated: true });
 
-check("模式 'ja' 只显示原文",
-  titleDisplayParts(rec, 'ja'), { main: '新人デビュー', sub: '', badge: '', translated: false });
+check("模式 'ja' 只显示原文（没有 hover，因为已经是原文）",
+  titleDisplayParts(rec, 'ja'),
+  { main: '新人デビュー', sub: '', hover: '', badge: '', translated: false });
 
-check('没有译文 → 老实显示原文，不留空白',
+check('覆盖率不够 → 标「半」而不是「译」（这是 v1.4.1 的关键修正）',
+  titleDisplayParts({ ...rec, titleCoverage: 0.56 }).badge, 'part');
+
+check('覆盖率正好到门槛 → 算「译得动」',
+  titleDisplayParts({ ...rec, titleCoverage: FULL_COVERAGE }).badge, 'full');
+
+check('覆盖率缺失的老记录 → 按「译得动」算，不凭空标「半」',
+  titleDisplayParts({ title: 'A', titleZh: 'B', titleSrc: 'glossary' }).badge, 'full');
+
+check('没有译文 → 老实显示原文，留空白是更糟的选择',
   titleDisplayParts({ title: '新人デビュー' }),
-  { main: '新人デビュー', sub: '', badge: '', translated: false });
+  { main: '新人デビュー', sub: '', hover: '', badge: '', translated: false });
 
 check('连原文都没有 → 退回文件名',
   titleDisplayParts({ fileName: 'SONE-119.mp4' }),
-  { main: 'SONE-119.mp4', sub: '', badge: '', translated: false });
+  { main: 'SONE-119.mp4', sub: '', hover: '', badge: '', translated: false });
 
-check('译文与原文相同时视为没译（不显示「译」角标）',
-  titleDisplayParts({ title: 'X', titleZh: 'X' }).badge, '');
+check('译文与原文相同时视为没译（不显示角标，也不给没用的悬停）',
+  titleDisplayParts({ title: 'X', titleZh: 'X' }),
+  { main: 'X', sub: '', hover: '', badge: '', translated: false });
 
 check('非 glossary 来源不挂「译」角标（手动改过的译名）',
   titleDisplayParts({ title: 'X', titleZh: 'Y', titleSrc: 'manual' }).badge, '');

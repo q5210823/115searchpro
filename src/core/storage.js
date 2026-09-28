@@ -16,6 +16,9 @@
  * 数据完全本地，支持导出/导入 JSON 备份，清缓存前请先导出。
  */
 
+// 统计口径要用到「译得动」的覆盖率门槛（bundler 会把 glossary.js 排在前面）
+import { FULL_COVERAGE } from './glossary.js';
+
 const DB_NAME = 'jv115-tagger';
 /**
  * ⚠️ 升级版本号时，onupgradeneeded 会整体重跑。
@@ -268,6 +271,14 @@ export function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirI
      */
     titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
     titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
+    /*
+     * 译文覆盖率（0~1）。用来区分「译得动」和「只译到一两个词」——
+     * 没有这个数就只能知道「有没有译文」，而一条 56% 覆盖率的标题
+     * 在界面上看起来和完整译名没区别，用户只会觉得「根本没翻译」。
+     */
+    titleCoverage: Number.isFinite(src?.titleCoverage)
+      ? src.titleCoverage
+      : (keepPrev ? prev.titleCoverage : undefined),
     actresses: src ? cleanArr(src.actresses) : [],
     genres: src ? cleanArr(src.genres) : [],
     cover: src ? (src.cover || '') : '',
@@ -415,6 +426,18 @@ export async function pruneLibraryDuplicates(keepRecords) {
 }
 
 /**
+ * 取一条记录的译文覆盖率。
+ *
+ * 没这个字段的记录（v1.4.0 存下来的，当时只存了译文本身）按「译得动」算 ——
+ * 不确定的时候宁可归到「能读」，也不要凭空给用户一堆「半译」。
+ * 升到 GLOSSARY_VERSION 2 之后重译一次，这个字段就会补齐。
+ */
+function covOf(r) {
+  const c = Number(r?.titleCoverage);
+  return Number.isFinite(c) ? c : 1;
+}
+
+/**
  * 汇总可筛选的维度：演员 / 类别 / 目录。
  * 供资料库页签生成筛选 chips（带出现次数，按次数降序）。
  */
@@ -435,8 +458,15 @@ export async function getLibraryFacets() {
   return {
     total: all.length,
     gone,
-    // 已经有中文译名的条数（面板上显示「已译 N 条」，让用户知道进度）
-    translated: all.filter((r) => r.titleZh).length,
+    /*
+     * 标题中译的完成度分档。
+     * ★ v1.4.0 用的是「只要有改动就算已译」，结果一条只译对一个词的标题
+     *   也计入「已译」，面板显示「已译 3293 条」而列表看着像没生效。
+     *   现在按覆盖率分三档，让用户一眼看出真正能读的有多少。
+     */
+    trFull: all.filter((r) => r.titleZh && covOf(r) >= FULL_COVERAGE).length,
+    trPart: all.filter((r) => r.titleZh && covOf(r) < FULL_COVERAGE).length,
+    trNone: all.filter((r) => !r.titleZh).length,
     actresses: tally((r) => r.actresses || []),
     genres: tally((r) => r.genres || []),
     cids: tally((r) => (r.cid ? [r.cid] : []))
@@ -480,10 +510,21 @@ export async function applyTitleZhBatch(entries) {
       for (const r of all.result || []) {
         const e = byCode.get(String(r.code || ''));
         if (!e) continue;
-        // 原文没变、译名也没变 → 不必写回（省 I/O）
-        if (r.titleZh === e.titleZh && r.titleHash === e.titleHash) continue;
+        /*
+         * 原文没变、译名和覆盖率也没变 → 不必写回（省 I/O）。
+         * ★ 覆盖率也要比：只比译文的话，老记录补覆盖率这一步会被跳过，
+         *   列表就永远拿不到「译得动 / 只译了一半」的区分。
+         */
+        if (
+          r.titleZh === e.titleZh &&
+          r.titleHash === e.titleHash &&
+          r.titleCoverage === e.titleCoverage
+        ) continue;
         libStore.put(Object.assign({}, r, {
-          titleZh: e.titleZh, titleSrc: e.titleSrc, titleHash: e.titleHash
+          titleZh: e.titleZh,
+          titleSrc: e.titleSrc,
+          titleHash: e.titleHash,
+          titleCoverage: e.titleCoverage
         }));
         libHits++;
       }
@@ -658,11 +699,11 @@ export const DEFAULT_SETTINGS = {
   autoTranslateTitles: true,
   /**
    * 资料库列表里标题怎么显示：
-   *   'zh-ja' 中文主行 + 原文副行（默认，原文不丢）
-   *   'zh'    只显示中文
+   *   'zh'    只显示中文一行，原文放到鼠标悬停（默认）
+   *   'zh-ja' 中文一行 + 原文一行（想常驻对照时再切）
    *   'ja'    只显示原文
    */
-  titleDisplay: 'zh-ja'
+  titleDisplay: 'zh'
 };
 
 export async function loadSettings() {

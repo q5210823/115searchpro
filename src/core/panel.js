@@ -232,8 +232,8 @@ const PANEL_HTML = `
       <div class="row">
         <label style="width:96px">标题显示</label>
         <select class="grow" id="cfgTitleDisplay">
-          <option value="zh-ja">中文主行 + 原文副行（推荐）</option>
-          <option value="zh">只显示中文</option>
+          <option value="zh">只显示中文（原文放悬停，推荐）</option>
+          <option value="zh-ja">中文一行 + 原文一行</option>
           <option value="ja">只显示原文</option>
         </select>
       </div>
@@ -456,8 +456,8 @@ export function createPanel(handlers = {}) {
     $('#cfgPlayerUrl').value = cfg.playerUrlTemplate || DEFAULT_PLAYER_URL;
     $('#cfgPlayMode').value = cfg.playMode === 'inpage' ? 'inpage' : 'page';
     // 标题中译
-    const modes = ['zh-ja', 'zh', 'ja'];
-    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh-ja';
+    const modes = ['zh', 'zh-ja', 'ja'];
+    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh';
     $('#cfgAutoTranslate').checked = cfg.autoTranslateTitles !== false;
     const gv = $('#cfgGlossaryVer');
     if (gv) gv.textContent = `v${GLOSSARY_VERSION} · ${glossarySize()} 词条`;
@@ -488,7 +488,7 @@ export function createPanel(handlers = {}) {
     await setSetting('playMode', $('#cfgPlayMode').value === 'inpage' ? 'inpage' : 'page');
     // 标题中译
     const td = $('#cfgTitleDisplay').value;
-    await setSetting('titleDisplay', ['zh-ja', 'zh', 'ja'].includes(td) ? td : 'zh-ja');
+    await setSetting('titleDisplay', ['zh', 'zh-ja', 'ja'].includes(td) ? td : 'zh');
     await setSetting('autoTranslateTitles', $('#cfgAutoTranslate').checked);
     toast('设置已保存', 'ok');
     handlers.onSettingsChanged?.();
@@ -586,7 +586,7 @@ export function createPanel(handlers = {}) {
    * 不需要为每个维度建查询计划。
    * ================================================================ */
   // titleMode：标题显示方式，渲染前从设置里读一次（见 applyLibFilter）
-  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh-ja' };
+  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh' };
 
   /** 重新从库里读一次，并刷新下拉筛选器 + 列表 */
   async function loadLibrary() {
@@ -789,17 +789,27 @@ export function createPanel(handlers = {}) {
     else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
 
     /*
-     * v1.4.0：中文标题作主行，原日文降为副行。
-     * 原文**不丢** —— 术语表翻译是机器产物，只当索引用，原文才是权威。
+     * v1.4.1：默认只显示**一行中文**，原文放进 `title` 属性（鼠标悬停才看）。
+     * 术语表翻译是机器产物、只当索引用，原文才是权威 —— 但让原文常驻第二行，
+     * 列表每条都占两行，扫起来反而费劲（v1.4.0 就是这么做的，实测不好用）。
      * 没有译文时老实退回原文（`titleDisplayParts` 里保证不留空白）。
+     *
+     * 角标分「译 / 半」：只译到一两个词的标题不再冒充完整译名。
+     * v1.4.0 一律标「译」，于是 56% 覆盖率的标题看着和译好的没区别，
+     * 用户的结论只能是「根本没翻译」。
      */
     const t = titleDisplayParts(r, libState.titleMode);
-    const zhBadge = t.badge
+    const cov = Number(r.titleCoverage);
+    const pct = Number.isFinite(cov) ? Math.round(cov * 100) : null;
+    const zhBadge = t.badge === 'full'
       ? '<span class="badge tr" title="本地术语表翻译，非官方译名">译</span>'
-      : '';
+      : t.badge === 'part'
+        ? `<span class="badge tr half" title="只译到一部分${pct == null ? '' : `（约 ${pct}%）`}，剩下的仍是日文 —— 术语表翻不掉长句里的动词活用和助词">半</span>`
+        : '';
     const subLine = t.sub
       ? `<div class="ttl-ja" title="原日文标题">${escapeHtml(t.sub)}</div>`
       : '';
+    const ttlTip = t.hover ? `原日文标题：${t.hover}` : t.main;
 
     const playTitle = r.pickcode
       ? '在新标签页打开播放页'
@@ -808,7 +818,7 @@ export function createPanel(handlers = {}) {
     return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
       <div class="mid">
         <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-        <div class="ttl" title="${escapeHtml(t.main)}">${escapeHtml(t.main)}${zhBadge}</div>
+        <div class="ttl" title="${escapeHtml(ttlTip)}">${escapeHtml(t.main)}${zhBadge}</div>
         ${subLine}
         <div class="tags">${tagLine}</div>
       </div>
@@ -902,7 +912,7 @@ export function createPanel(handlers = {}) {
       });
       // 每次渲染前读一次显示方式：用户在设置里改完，回到列表就能生效
       const cfg = await loadSettings();
-      libState.titleMode = cfg.titleDisplay || 'zh-ja';
+      libState.titleMode = cfg.titleDisplay || 'zh';
     } catch (e) {
       toast(`筛选失败：${e.message}`, 'err');
       return;
@@ -914,10 +924,17 @@ export function createPanel(handlers = {}) {
     // 缺提取码 = 点「播放」也开不了播放页的那批（收录一次即可补全）
     const noPc = rows.filter((r) => !r.pickcode && !r.gone).length;
     const filtered = rows.length !== total;
-    // 已译：有一定比例才报，免得全是 0 时刷屏
-    const translated = libState.facets ? (libState.facets.translated || 0) : 0;
-    const transTip = translated
-      ? ` · <span style="color:#2b5cff">已译 ${translated} 条</span>`
+    /*
+     * 标题中译的完成度按三档报。
+     * ★ 别退回「已译 N 条」这种口径 —— 只要有一处改动就算「已译」的话，
+     *   一条只把「同窓会」译成「同窗会」、其余全是日文的标题也算译好了，
+     *   面板显示「已译 3293 条」而列表看着像没生效，两边都没说谎。
+     */
+    const trFull = libState.facets ? (libState.facets.trFull || 0) : 0;
+    const trPart = libState.facets ? (libState.facets.trPart || 0) : 0;
+    const transTip = trFull || trPart
+      ? ` · 中译 <span style="color:#2b5cff">译得动 ${trFull}</span>`
+        + ` · <span style="color:#8a6d3b">半译 ${trPart}</span>`
       : '';
     $('#libStat').innerHTML =
       `资料库共 <b>${total}</b> 条` +

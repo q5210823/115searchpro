@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         115 网盘 JAV 标签助手
 // @namespace    https://github.com/jv115-tagger
-// @version      1.4.0
+// @version      1.4.1
 // @description  读取 115 网盘视频文件名，自动提取番号，从 JavBus / javlibrary 拉取影片信息，在文件列表上以「标题+演员+类别」标签形式展示。纯本地标签库，不改动 115 任何原始文件，无需 API key。
 // @author       jv115-tagger
 // @match        *://*.115.com/*
@@ -881,847 +881,6 @@ function buildManualLinks(code, cfg = {}) {
 
 
 /* ==================================================================
- * core/storage.js
- * ================================================================== */
-
-/**
- * 本地标签库（IndexedDB 存储层）
- * ------------------------------------------------------------------
- * 方案 C 的核心：标签不打回 115，而是存在浏览器本地。
- *
- * 五张表：
- *   meta     番号 -> 影片元数据（标题/演员/厂商/封面/标签）
- *   fileMap  115 文件 ID -> 番号 的映射（含文件名快照，用于变更检测）
- *   library  「收录」结果：一个视频文件一条，含 cid / 番号 / 演员 / 类别
- *            —— 这是「资料库」页签的数据源，支持按演员、类别筛选
- *   dirs     每个收录过的目录的汇总（收录时间 / 条目数 / 上次新增多少）
- *            —— 「增量收录」的依据：同一目录再收一次时，靠它和 library
- *               对照，只对「新文件」和「上次没抓到标签的」发请求
- *   settings 键值配置（api key、并发数、数据源开关等）
- *
- * 数据完全本地，支持导出/导入 JSON 备份，清缓存前请先导出。
- */
-
-const DB_NAME = 'jv115-tagger';
-/**
- * ⚠️ 升级版本号时，onupgradeneeded 会整体重跑。
- * 里面每个建表动作都用 `contains` 包住，所以老表及其数据不受影响，
- * 只有新增的表会被创建。绝对不要在 upgrade 里 drop 既有表。
- */
-const DB_VERSION = 3;
-const STORE_META = 'meta';
-const STORE_FILEMAP = 'fileMap';
-const STORE_LIBRARY = 'library';
-const STORE_DIRS = 'dirs';
-const STORE_SETTINGS = 'settings';
-
-let _dbPromise = null;
-
-/** 打开数据库（单例） */
-function openDB() {
-  if (_dbPromise) return _dbPromise;
-
-  _dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-
-    req.onupgradeneeded = (event) => {
-      const db = event.target.result;
-
-      if (!db.objectStoreNames.contains(STORE_META)) {
-        const s = db.createObjectStore(STORE_META, { keyPath: 'code' });
-        s.createIndex('title', 'title', { unique: false });
-        s.createIndex('fetchedAt', 'fetchedAt', { unique: false });
-        s.createIndex('source', 'source', { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_FILEMAP)) {
-        const s = db.createObjectStore(STORE_FILEMAP, { keyPath: 'fileId' });
-        s.createIndex('code', 'code', { unique: false });
-        s.createIndex('updatedAt', 'updatedAt', { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_LIBRARY)) {
-        const s = db.createObjectStore(STORE_LIBRARY, { keyPath: 'id' });
-        s.createIndex('code', 'code', { unique: false });
-        s.createIndex('cid', 'cid', { unique: false });
-        // multiEntry：一个文件可以有多个演员 / 多个类别，
-        // 建多值索引后可以直接按「演员A」查出所有含该演员的记录。
-        s.createIndex('actresses', 'actresses', { unique: false, multiEntry: true });
-        s.createIndex('genres', 'genres', { unique: false, multiEntry: true });
-        s.createIndex('updatedAt', 'updatedAt', { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_DIRS)) {
-        const s = db.createObjectStore(STORE_DIRS, { keyPath: 'cid' });
-        s.createIndex('harvestedAt', 'harvestedAt', { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORE_SETTINGS)) {
-        db.createObjectStore(STORE_SETTINGS, { keyPath: 'key' });
-      }
-    };
-
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-
-  return _dbPromise;
-}
-
-/** 通用事务包装 */
-async function withStore(storeName, mode, fn) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, mode);
-    const store = tx.objectStore(storeName);
-    let result;
-    try {
-      result = fn(store);
-    } catch (e) {
-      reject(e);
-      return;
-    }
-    tx.oncomplete = () => resolve(result);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error('事务被中止'));
-  });
-}
-
-/** 把 IDBRequest 转成 Promise */
-function reqToPromise(request) {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-/* ==================== meta 表操作 ==================== */
-
-/** 缓存实现，供 MetaResolver 使用 */
-const metaCache = {
-  async get(code) {
-    const db = await openDB();
-    const tx = db.transaction(STORE_META, 'readonly');
-    return reqToPromise(tx.objectStore(STORE_META).get(code));
-  },
-  async put(meta) {
-    return putMeta(meta);
-  }
-};
-async function putMeta(meta) {
-  if (!meta || !meta.code) throw new Error('meta 缺少 code 字段');
-  const record = { ...meta, fetchedAt: meta.fetchedAt || Date.now() };
-  await withStore(STORE_META, 'readwrite', (s) => s.put(record));
-  return record;
-}
-async function putMetaBatch(list) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_META, 'readwrite');
-    const store = tx.objectStore(STORE_META);
-    list.forEach((m) => m && m.code && store.put({ ...m, fetchedAt: m.fetchedAt || Date.now() }));
-    tx.oncomplete = () => resolve(list.length);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function getMeta(code) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_META, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_META).get(code));
-}
-async function getAllMeta() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_META, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_META).getAll());
-}
-async function countMeta() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_META, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_META).count());
-}
-async function deleteMeta(code) {
-  return withStore(STORE_META, 'readwrite', (s) => s.delete(code));
-}
-
-/* ==================== fileMap 表操作 ==================== */
-
-/**
- * 记录「115 文件 -> 番号」映射。
- * 存 nameSnapshot 是为了检测文件是否被改名/替换。
- */
-async function putFileMap({ fileId, code, fileName, confidence }) {
-  const record = {
-    fileId: String(fileId),
-    code,
-    fileName,
-    nameSnapshot: fileName,
-    confidence: confidence ?? 0,
-    updatedAt: Date.now()
-  };
-  await withStore(STORE_FILEMAP, 'readwrite', (s) => s.put(record));
-  return record;
-}
-async function putFileMapBatch(list) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_FILEMAP, 'readwrite');
-    const store = tx.objectStore(STORE_FILEMAP);
-    list.forEach((r) => {
-      store.put({
-        fileId: String(r.fileId),
-        code: r.code,
-        fileName: r.fileName,
-        nameSnapshot: r.fileName,
-        confidence: r.confidence ?? 0,
-        updatedAt: Date.now()
-      });
-    });
-    tx.oncomplete = () => resolve(list.length);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function getFileMap(fileId) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_FILEMAP, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_FILEMAP).get(String(fileId)));
-}
-async function getAllFileMap() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_FILEMAP, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_FILEMAP).getAll());
-}
-async function countFileMap() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_FILEMAP, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_FILEMAP).count());
-}
-
-/* ==================== library 表操作（资料库） ==================== */
-
-/**
- * 把 meta（可能是 null / notFound）+ 文件信息组装成一条 library 记录。
- *
- * id 用 `cid@@fileName`：
- *   - 同名的文件在不同目录下是两个条目，不会被互相覆盖
- *   - 目录内改名会变成新条目（旧的留给用户手动清理）
- *
- * @param {object} p
- * @param {object|null} p.prev 同一文件的**上一条记录**（增量收录时传入）。
- *   作用：① 保留 firstSeenAt（首次见到的时间）；② 新一次没抓到标签时
- *   不把已有的标签覆盖掉（数据源偶尔抽风不该让库里的信息变少）。
- */
-function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirIndex, code, meta, confidence, prev = null }) {
-  const cleanArr = (v) => {
-    if (!Array.isArray(v)) return [];
-    return [...new Set(v.map((x) => String(x ?? '').trim()).filter(Boolean))];
-  };
-  const now = Date.now();
-
-  const fresh = meta && !meta.notFound;
-  // 同一个番号、上次拿到了标签、这次却没拿到 → 保留旧数据，别让信息退化
-  const keepPrev = !fresh && prev && prev.matched && prev.code === (code || '');
-  const src = fresh ? meta : (keepPrev ? prev : null);
-
-  return {
-    id: `${cid || ''}@@${fileName}`,
-    cid: String(cid || ''),
-    fileName: String(fileName || ''),
-    fileId: fileId ? String(fileId) : (keepPrev ? prev.fileId : null),
-    // pickcode 是 115 播放接口唯一需要的参数，收录时能挖到就一定要存下来
-    pickcode: pickcode ? String(pickcode) : (keepPrev ? prev.pickcode : null),
-    size: size || (keepPrev ? prev.size : ''),
-    // 该文件在整个目录清单里的位置（含文件夹）。
-    // 115 网页每页只渲染 24 条，点播放时要靠它算「该翻到第几页」，
-    // 否则 78 页的目录里点一条第 50 页的文件会「跳回目录但找不到」。
-    dirIndex: Number.isFinite(dirIndex) ? dirIndex : (prev && Number.isFinite(prev.dirIndex) ? prev.dirIndex : null),
-    code: code || '',
-    confidence: confidence ?? 0,
-    title: src ? (src.title || '') : '',
-    /*
-     * 中文标题（术语表翻译）。跟 title 一样从元数据抄一份到条目上 ——
-     * 列表渲染读的是 library 记录，不抄的话译文要等下次收录才看得到。
-     * 翻译本身是按「番号」缓存在 meta 表里的，这里只是个副本。
-     */
-    titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
-    titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
-    actresses: src ? cleanArr(src.actresses) : [],
-    genres: src ? cleanArr(src.genres) : [],
-    cover: src ? (src.cover || '') : '',
-    source: src ? (src.source || '') : '',
-    matched: !!(fresh || keepPrev),
-    keptPrev: keepPrev,
-    // 增量收录用：gone=true 表示「上次收录过，这次目录里已经没有了」
-    gone: false,
-    firstSeenAt: (prev && prev.firstSeenAt) || now,
-    lastSeenAt: now,
-    harvestedAt: (prev && prev.harvestedAt) || now,
-    updatedAt: now
-  };
-}
-async function putLibraryBatch(list) {
-  if (!list || !list.length) return 0;
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
-    const store = tx.objectStore(STORE_LIBRARY);
-    list.forEach((r) => r && r.id && store.put(r));
-    tx.oncomplete = () => resolve(list.length);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function getAllLibrary() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_LIBRARY, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_LIBRARY).getAll());
-}
-async function countLibrary() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_LIBRARY, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_LIBRARY).count());
-}
-
-/**
- * 取某个目录下已经收录的条目（走 cid 索引）。
- * 增量收录的第一步：拿它和接口返回的当前文件清单对照，
- * 就能算出「新增 / 未变 / 已失效」三类。
- */
-async function getLibraryByCid(cid) {
-  const key = String(cid || '');
-  if (!key) return [];
-  const db = await openDB();
-  const tx = db.transaction(STORE_LIBRARY, 'readonly');
-  const idx = tx.objectStore(STORE_LIBRARY).index('cid');
-  return reqToPromise(idx.getAll(key));
-}
-
-/** 统计「已失效」条目数（文件已从 115 目录里消失） */
-async function countLibraryGone() {
-  const all = await getAllLibrary();
-  return all.filter((r) => r.gone).length;
-}
-
-/** 删除全部「已失效」条目，返回删掉的条数 */
-async function deleteLibraryGone() {
-  const all = await getAllLibrary();
-  const gone = all.filter((r) => r.gone);
-  if (!gone.length) return 0;
-  const db = await openDB();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
-    const store = tx.objectStore(STORE_LIBRARY);
-    gone.forEach((r) => store.delete(r.id));
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-  return gone.length;
-}
-
-/* ==================== dirs 表操作 ==================== */
-
-/**
- * 记录/更新一个目录的收录汇总。
- * 只存「轻量元信息」，不存文件清单本身（清单就在 library 表里）。
- */
-async function putDirMeta(rec) {
-  if (!rec || !rec.cid) throw new Error('dirs 记录缺少 cid');
-  return withStore(STORE_DIRS, 'readwrite', (s) => s.put({
-    ...rec,
-    cid: String(rec.cid),
-    harvestedAt: rec.harvestedAt || Date.now()
-  }));
-}
-async function getDirMeta(cid) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_DIRS, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_DIRS).get(String(cid || '')));
-}
-async function getAllDirs() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_DIRS, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_DIRS).getAll());
-}
-async function countDirs() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_DIRS, 'readonly');
-  return reqToPromise(tx.objectStore(STORE_DIRS).count());
-}
-async function deleteLibrary(id) {
-  return withStore(STORE_LIBRARY, 'readwrite', (s) => s.delete(id));
-}
-async function clearLibrary() {
-  return withStore(STORE_LIBRARY, 'readwrite', (s) => s.clear());
-}
-
-/**
- * 清理「同一个文件但 id 不同」的旧记录，返回删掉的条数。
- *
- * 为什么需要：id = `cid@@fileName`，所以 cid 一旦变化，同一部片会算出两个 id。
- * 典型场景就是「cid 取值方式修好后重新收录」—— 旧记录里带着错的 cid
- * （比如 0），不清理就会同一部片在资料库里出现两条。
- *
- * @param {Array} keepRecords 本次刚写入的记录，它们的 id 视为最新
- */
-async function pruneLibraryDuplicates(keepRecords) {
-  if (!keepRecords || !keepRecords.length) return 0;
-  const keepIds = new Set(keepRecords.map((r) => r.id));
-  const names = new Set(keepRecords.map((r) => r.fileName).filter(Boolean));
-  if (!names.size) return 0;
-
-  const all = await getAllLibrary();
-  const stale = all.filter((r) => names.has(r.fileName) && !keepIds.has(r.id));
-  if (!stale.length) return 0;
-
-  const db = await openDB();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
-    const store = tx.objectStore(STORE_LIBRARY);
-    stale.forEach((r) => store.delete(r.id));
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-  return stale.length;
-}
-
-/**
- * 汇总可筛选的维度：演员 / 类别 / 目录。
- * 供资料库页签生成筛选 chips（带出现次数，按次数降序）。
- */
-async function getLibraryFacets() {
-  const allRaw = await getAllLibrary();
-  // 失效条目（文件已不在 115 目录里）默认不参与筛选维度统计
-  const gone = allRaw.filter((r) => r.gone).length;
-  const all = allRaw.filter((r) => !r.gone);
-  const tally = (pick) => {
-    const m = new Map();
-    all.forEach((r) => {
-      pick(r).forEach((v) => m.set(v, (m.get(v) || 0) + 1));
-    });
-    return [...m.entries()]
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-  };
-  return {
-    total: all.length,
-    gone,
-    // 已经有中文译名的条数（面板上显示「已译 N 条」，让用户知道进度）
-    translated: all.filter((r) => r.titleZh).length,
-    actresses: tally((r) => r.actresses || []),
-    genres: tally((r) => r.genres || []),
-    cids: tally((r) => (r.cid ? [r.cid] : []))
-  };
-}
-
-/**
- * 把「番号 → 中文标题」写回 meta，并同步到所有引用它的资料库条目。
- *
- * 为什么必须同步两处：
- *   - `meta` 是翻译的**存放处**（按番号缓存，同一部片只译一次）
- *   - `library` 是列表**渲染时的数据源**（它存的是副本）
- *   只写 meta 的话，列表里看不到译文，得重收一次目录才生效 —— 那个体验很差。
- */
-async function applyTitleZhBatch(entries) {
-  if (!entries || !entries.length) return { meta: 0, library: 0 };
-  const db = await openDB();
-  const byCode = new Map();
-  for (const e of entries) if (e && e.code) byCode.set(String(e.code), e);
-  if (!byCode.size) return { meta: 0, library: 0 };
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_META, STORE_LIBRARY], 'readwrite');
-    const metaStore = tx.objectStore(STORE_META);
-    const libStore = tx.objectStore(STORE_LIBRARY);
-    let metaHits = 0;
-    let libHits = 0;
-
-    // ① 元数据：按 code 取回来合并。取不到就跳过 —— 不凭空造记录
-    for (const [code, e] of byCode) {
-      const req = metaStore.get(code);
-      req.onsuccess = () => {
-        const cur = req.result;
-        if (cur) { metaStore.put(Object.assign({}, cur, e)); metaHits++; }
-      };
-    }
-
-    // ② 资料库：把译文抄到每个同番号的条目上
-    const all = libStore.getAll();
-    all.onsuccess = () => {
-      for (const r of all.result || []) {
-        const e = byCode.get(String(r.code || ''));
-        if (!e) continue;
-        // 原文没变、译名也没变 → 不必写回（省 I/O）
-        if (r.titleZh === e.titleZh && r.titleHash === e.titleHash) continue;
-        libStore.put(Object.assign({}, r, {
-          titleZh: e.titleZh, titleSrc: e.titleSrc, titleHash: e.titleHash
-        }));
-        libHits++;
-      }
-    };
-
-    tx.oncomplete = () => resolve({ meta: metaHits, library: libHits });
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-/**
- * 纯函数版筛选 —— 不碰数据库，便于单元测试。
- * 规则：
- *   - 关键词：大小写不敏感，命中番号/标题/文件名/演员/类别 任一即可
- *   - 演员/类别：多选时是 **AND**（要同时满足所有选中项）
- *     —— 选「演员A」+「演员B」表示「同时有这两个演员的作品」
- *   - hideGone：默认隐藏「已失效」条目（文件已从 115 目录消失）
- */
-function filterLibraryRows(all, {
-  keyword = '', actresses = [], genres = [], cid = '', hideGone = true
-} = {}) {
-  const kw = String(keyword || '').trim().toLowerCase();
-
-  return (all || []).filter((r) => {
-    if (hideGone && r.gone) return false;
-    if (cid && r.cid !== cid) return false;
-    if (actresses.length && !actresses.every((a) => (r.actresses || []).includes(a))) return false;
-    if (genres.length && !genres.every((g) => (r.genres || []).includes(g))) return false;
-    if (!kw) return true;
-    const hay = [r.code, r.title, r.fileName, ...(r.actresses || []), ...(r.genres || [])]
-      .join(' ')
-      .toLowerCase();
-    return hay.includes(kw);
-  }).sort((a, b) =>
-    String(a.code || '').localeCompare(String(b.code || '')) ||
-    String(a.fileName || '').localeCompare(String(b.fileName || ''))
-  );
-}
-
-/** 在库内按关键词 + 演员/类别筛选（先从 IDB 取全量，再走纯函数过滤） */
-async function queryLibrary(filters = {}) {
-  const all = await getAllLibrary();
-  return filterLibraryRows(all, filters);
-}
-
-/* ==================== settings 表操作 ==================== */
-async function setSetting(key, value) {
-  return withStore(STORE_SETTINGS, 'readwrite', (s) => s.put({ key, value }));
-}
-async function getSetting(key, defaultValue = null) {
-  const db = await openDB();
-  const tx = db.transaction(STORE_SETTINGS, 'readonly');
-  const row = await reqToPromise(tx.objectStore(STORE_SETTINGS).get(key));
-  return row ? row.value : defaultValue;
-}
-async function getAllSettings() {
-  const db = await openDB();
-  const tx = db.transaction(STORE_SETTINGS, 'readonly');
-  const rows = await reqToPromise(tx.objectStore(STORE_SETTINGS).getAll());
-  return rows.reduce((acc, r) => ({ ...acc, [r.key]: r.value }), {});
-}
-
-/**
- * 「播放」按钮的默认地址模板（唯一权威定义，main.js / panel.js 都从这里引）。
- * 可用变量：{pickcode} {cid} {fileId} {name}
- *
- * 取值来源：115Master 公开的播放器唤起接口。
- * 若在未安装 115Master 的环境下打不开，可在「设置」页改成自己环境可用的地址。
- *
- * ⚠️ 打包器会把所有模块拼进同一个作用域，所以这个名字全局只能出现一次。
- */
-const DEFAULT_PLAYER_URL =
-  'https://115.com/web/lixian/master/video/?pick_code={pickcode}&cid={cid}';
-
-/**
- * 播放方式。
- *
- *   PAGE   —— 点「播放」直接开播放页（一步直达，默认）
- *   INPAGE —— 跳回该文件所在目录，在网页列表里定位并模拟点击播放
- *
- * 为什么默认是 PAGE 而不是「自动检测」：
- *   115Master 的 DOM 标记（#master-app / x-player）**只在播放页挂载**，
- *   文件列表页上根本不存在。所以在列表页做「装没装 115Master」的检测
- *   必然返回 false —— 旧版的 auto 模式等于被强制降级成 INPAGE，
- *   用户看到的现象就是「点了播放却跳回目录，还找不到视频」。
- *   与其猜，不如直接开播放页；开出来是不是空白由「播放页自检」事后判定。
- */
-const PLAY_MODES = { PAGE: 'page', INPAGE: 'inpage' };
-
-/** 把历史/非法值归一化为当前支持的播放方式 */
-function normalizePlayMode(v) {
-  if (v === PLAY_MODES.INPAGE) return PLAY_MODES.INPAGE;
-  // 历史值：'auto'（在列表页恒判 false，等于强制模拟点击）、'master'（开播放页）
-  return PLAY_MODES.PAGE;
-}
-
-/**
- * 从一条资料库记录里取模板变量（纯函数，便于单测）。
- *
- * {name} = 去掉扩展名的文件名。留给「用搜索页接文件」这类自定义模板，
- * 默认模板用不到它。
- */
-function playerTemplateVars(row = {}) {
-  return {
-    pickcode: row.pickcode || '',
-    cid: row.cid || '',
-    fileId: row.fileId || '',
-    name: String(row.fileName || '').replace(/\.[a-z0-9]{2,5}$/i, '')
-  };
-}
-
-/**
- * 按模板拼播放地址（纯函数，便于单测）。
- *
- * 模板里写了但没提供的变量**保持原样**，不替换成空串 ——
- * 这样用户一眼就能看出「{foo} 这个变量不存在」，比拼出一个残缺 URL 好排查。
- */
-function fillPlayerTemplate(tpl, vars = {}) {
-  return String(tpl || '').replace(/\{(\w+)\}/g, (m, k) =>
-    Object.prototype.hasOwnProperty.call(vars, k) ? encodeURIComponent(vars[k]) : m
-  );
-}
-
-/**
- * 播放页自检结果的存放键。
- *
- * 脚本在**播放页**里也会运行，那一侧才检测得准。
- * 判定结果写进 localStorage，列表页打开播放页前先读一眼：
- * 上次如果是空白页，就先提醒用户，不要让他对着白屏发呆。
- */
-const PLAYER_PROBE_KEY = 'jv115-player-probe';
-/** 自检结果的有效期（ms）：超过就重新判一次，避免用户后来装了 115Master 还一直报错 */
-const PLAYER_PROBE_TTL = 10 * 60 * 1000;
-const DEFAULT_SETTINGS = {
-  // 数据源（默认全部走网页直连，不需要任何 key）
-  enableJavbus: true,
-  javbusBaseUrl: 'https://www.javbus.com',
-  enableJavlibrary: true,
-  javlibraryBaseUrl: 'https://www.javlibrary.com',
-  javlibraryLang: 'cn',
-  // DMM 可选（有 key 才启用）
-  enableDmm: false,
-  dmmApiId: '',
-  dmmAffiliateId: '',
-  // 行为
-  concurrency: 3,
-  useCache: true,
-  autoInjectColumn: true,
-  cacheTTLDays: 30,
-  minConfidence: 60,
-  showCover: false,
-  // 悬停浮层空间充裕 → 0 表示全显示，不截断
-  maxActress: 0,
-  maxGenres: 0,
-  /**
-   * 点「播放」时怎么打开（取值见上方 PLAY_MODES）：
-   *   'page'   直接打开播放页（一步直达，默认）
-   *   'inpage' 跳回目录 + 页面内模拟点击播放（不依赖任何插件，但受分页/渲染影响）
-   */
-  playMode: PLAY_MODES.PAGE,
-  /** 「播放」按钮的地址模板，见文件上方 DEFAULT_PLAYER_URL 的说明 */
-  playerUrlTemplate: DEFAULT_PLAYER_URL,
-  /**
-   * 标题中译（见 core/glossary.js）。
-   * 纯本地术语表，不联网、不花钱、没有内容审核问题。
-   * 自动模式：每次查询元数据后顺手把新标题译掉，用户不用手动点。
-   */
-  autoTranslateTitles: true,
-  /**
-   * 资料库列表里标题怎么显示：
-   *   'zh-ja' 中文主行 + 原文副行（默认，原文不丢）
-   *   'zh'    只显示中文
-   *   'ja'    只显示原文
-   */
-  titleDisplay: 'zh-ja'
-};
-async function loadSettings() {
-  const saved = await getAllSettings();
-  const merged = { ...DEFAULT_SETTINGS, ...saved };
-  // 历史存档里可能是 'auto'/'master'，这里统一迁移，面板上的下拉才不会空掉
-  merged.playMode = normalizePlayMode(merged.playMode);
-  if (!merged.playerUrlTemplate) merged.playerUrlTemplate = DEFAULT_PLAYER_URL;
-  return merged;
-}
-
-/* ==================== 导出 / 导入 ==================== */
-
-/** 导出全部数据为 JSON 字符串 */
-async function exportAll() {
-  const [meta, fileMap, library, dirs, settings] = await Promise.all([
-    getAllMeta(),
-    getAllFileMap(),
-    getAllLibrary(),
-    getAllDirs(),
-    getAllSettings()
-  ]);
-  return JSON.stringify(
-    {
-      _format: 'jv115-tagger-backup',
-      _version: DB_VERSION,
-      _exportedAt: new Date().toISOString(),
-      meta,
-      fileMap,
-      library,
-      dirs,
-      settings
-    },
-    null,
-    2
-  );
-}
-
-/**
- * 导入备份。默认合并（同 key 覆盖）。
- * @param {string} jsonText
- * @param {{merge?: boolean}} opts merge=false 时先清空
- */
-async function importAll(jsonText, opts = {}) {
-  const data = JSON.parse(jsonText);
-  if (data._format !== 'jv115-tagger-backup') {
-    throw new Error('备份文件格式不匹配');
-  }
-
-  if (opts.merge === false) {
-    await clearAll();
-  }
-
-  const metaCount = await putMetaBatch(data.meta || []);
-  const mapCount = await putFileMapBatch(data.fileMap || []);
-  const libCount = await putLibraryBatch(data.library || []);
-
-  let dirCount = 0;
-  for (const d of data.dirs || []) {
-    if (d && d.cid) { await putDirMeta(d); dirCount++; }
-  }
-
-  let settingCount = 0;
-  if (data.settings) {
-    for (const [key, value] of Object.entries(data.settings)) {
-      await setSetting(key, value);
-      settingCount++;
-    }
-  }
-
-  return { metaCount, mapCount, libCount, dirCount, settingCount };
-}
-
-/** 清空所有业务数据（不含设置） */
-async function clearAll() {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_META, STORE_FILEMAP, STORE_LIBRARY, STORE_DIRS], 'readwrite');
-    tx.objectStore(STORE_META).clear();
-    tx.objectStore(STORE_FILEMAP).clear();
-    tx.objectStore(STORE_LIBRARY).clear();
-    tx.objectStore(STORE_DIRS).clear();
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
-/** 清理超过 TTL 的缓存条目 */
-async function purgeExpired(ttlDays = 30) {
-  const cutoff = Date.now() - ttlDays * 86400 * 1000;
-  const all = await getAllMeta();
-  const expired = all.filter((m) => (m.fetchedAt || 0) < cutoff);
-  const db = await openDB();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_META, 'readwrite');
-    const store = tx.objectStore(STORE_META);
-    expired.forEach((m) => store.delete(m.code));
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
-  return expired.length;
-}
-
-/** 获取统计信息 */
-async function getStats() {
-  const [metaCount, mapCount, libCount, dirCount] = await Promise.all([
-    countMeta(),
-    countFileMap(),
-    countLibrary(),
-    countDirs()
-  ]);
-  const all = await getAllMeta();
-  const bySource = all.reduce((acc, m) => {
-    acc[m.source] = (acc[m.source] || 0) + 1;
-    return acc;
-  }, {});
-  const goneCount = await countLibraryGone();
-  return { metaCount, mapCount, libCount, dirCount, goneCount, bySource };
-}
-
-
-/* ==================================================================
- * core/paging.js
- * ================================================================== */
-
-/**
- * 资料库列表的分批渲染（懒加载）
- * ------------------------------------------------------------------
- * 为什么需要它：
- *   命中几千条时一次性塞进 DOM 会卡；更要命的是**用户看不见「下面还有多少」** ——
- *   旧实现是 `rows.slice(0, 300)` 静默截断，既不说截断了、也没法继续看，
- *   观感就是「筛选完显示不全，也没有翻页」。
- *
- * 现在的做法：
- *   · 先渲染前 LIB_PAGE_SIZE 条；
- *   · 滚到底部（footer 进入视口）自动追加下一批；
- *   · 底部常驻一行状态，写明「已显示 X / 共 Y 条」或「已全部显示」。
- *
- * 这里只放**纯计算**（方便单测）；DOM 操作在 panel.js 里。
- * ⚠️ 打包器把所有模块拼进同一作用域，常量名全局唯一。
- */
-
-/** 每批渲染多少条（用户要求：默认显示 50 条） */
-const LIB_PAGE_SIZE = 50;
-
-/**
- * 算出下一批要渲染的区间。
- *
- * @param {number} total 本次筛选命中的总条数
- * @param {number} shown 已经渲染了多少条
- * @param {number} [size] 每批条数
- * @returns {{from:number, to:number, added:number, hasMore:boolean}}
- *          from/to 为 [from, to) 左闭右开区间；added 是本批新增条数
- */
-function libPageWindow(total, shown, size = LIB_PAGE_SIZE) {
-  // 容错：任何非数字/负数/越界的输入都要夹到合法区间，绝不能算出 NaN 让 slice 静默返回空数组
-  const t = Math.max(0, Math.floor(Number(total)) || 0);
-  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
-
-  /*
-   * size 非法（NaN / 0 / 负数）一律**回落默认值**。
-   * ⚠️ 不能写成 `Math.max(1, size || DEFAULT)`：负数是 truthy，
-   *    会被 max 抬成 1 —— 退化成「一次一条」，比报错还难发现。
-   */
-  const rawStep = Math.floor(Number(size));
-  const step = Number.isFinite(rawStep) && rawStep > 0 ? rawStep : LIB_PAGE_SIZE;
-
-  const from = s;
-  const to = Math.min(from + step, t);
-  return { from, to, added: to - from, hasMore: to < t };
-}
-
-/**
- * 底部状态行文案。
- *
- * 关键点：**加载完必须明确说「已全部显示」**。
- * 否则用户滚到底看到没有新内容，仍会怀疑「是不是还有没加载出来的」——
- * 这正是这次要修的观感问题。
- *
- * @param {number} total 命中总数
- * @param {number} shown 已渲染条数
- * @param {boolean} [loading] 是否正在加载
- * @returns {string} 空串表示不需要 footer
- */
-function libFootText(total, shown, loading = false) {
-  const t = Math.max(0, Math.floor(Number(total)) || 0);
-  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
-
-  if (t === 0) return '';
-  if (loading) return `正在加载… 已显示 ${s} / ${t} 条`;
-  if (s >= t) return `已全部显示（共 ${t} 条）`;
-  return `已显示 ${s} / 共 ${t} 条 · 继续下滑自动加载`;
-}
-
-
-/* ==================================================================
  * core/glossary.js
  * ================================================================== */
 
@@ -1765,8 +924,23 @@ function libFootText(total, shown, loading = false) {
  * ★ 只要改了下面的词条表，就必须把它 +1 ——
  *   翻译缓存用 `hash(原文 + 版本号)` 判断是否需要重译，
  *   不升版本的话，老条目的译文会一直停在旧规则上。
+ *
+ * v1 → v2：词条没动，但翻译结果里多存了「覆盖率」一项。
+ *   不升版本的话已译条目不会重算，界面就永远拿不到
+ *   「译得动 / 只译了一半」的区分。
  */
-const GLOSSARY_VERSION = 1;
+const GLOSSARY_VERSION = 2;
+
+/**
+ * 「译得动」的覆盖率门槛。
+ *
+ * ★ 为什么需要这个数：v1.4.0 只要译文与原文有**一个词**不同就标「译」，
+ *   于是一条只把「同窓会」换成「同窗会」、其余全是日文的标题也挂着「译」角标。
+ *   面板上于是显示「已译 3293 条」，用户看列表却觉得「大部分没生效」——
+ *   两边都没说谎，是指标本身没意义。
+ *   低于这个门槛的标「半」（只译到一部分），别冒充完整译名。
+ */
+const FULL_COVERAGE = 0.75;
 
 /* ------------------------------------------------------------------
  * 1. 厂商 / 系列：日文写法 → 通用中文/官方写法
@@ -2383,33 +1557,932 @@ function hashTitle(jaTitle) {
 }
 
 /* ------------------------------------------------------------------
- * 展示：中文主行 + 原文副行
+ * 展示：中文一行 + 原文放悬停
  * ------------------------------------------------------------------ */
 
 /**
  * 算出列表里该显示什么。
  *
- * @param {object} rec  资料库记录（用到 title / titleZh / titleSrc / fileName）
- * @param {string} mode 'zh-ja' 中文主行+原文副行（默认）/ 'zh' 只中文 / 'ja' 只原文
+ * ★ 默认只显示**一行中文**，原文放进 `hover`（鼠标悬停才看）。
+ *   早先默认是「中文主行 + 原文副行」两行，实测列表太挤、每条都占两行，
+ *   反而不好扫 —— 原文不是不用，是不该常驻占位。
+ *
+ * @param {object} rec  资料库记录（用到 title / titleZh / titleCoverage / titleSrc / fileName）
+ * @param {string} mode 'zh' 只中文（默认，原文放悬停）
+ *                      'zh-ja' 中文一行 + 原文一行（想看原文时再切）
+ *                      'ja' 只原文
+ * @returns {{main:string, sub:string, hover:string, badge:string, translated:boolean}}
+ *          badge: '' 无译文 / 'full' 译得动 / 'part' 只译到一部分
  */
-function titleDisplayParts(rec, mode = 'zh-ja') {
+function titleDisplayParts(rec, mode = 'zh') {
   const ja = String(rec?.title || '').trim();
   const zh = String(rec?.titleZh || '').trim();
   const fallback = String(rec?.fileName || '');
   const hasZh = !!zh && zh !== ja;
-  const badge = hasZh && rec?.titleSrc === 'glossary' ? '译' : '';
 
   if (mode === 'ja') {
-    return { main: ja || fallback, sub: '', badge: '', translated: false };
+    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
   }
   // 没有译文就老实显示原文，**不要留空白**
   if (!hasZh) {
-    return { main: ja || fallback, sub: '', badge: '', translated: false };
+    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
   }
-  if (mode === 'zh') {
-    return { main: zh, sub: '', badge, translated: true };
+
+  const hover = ja && ja !== zh ? ja : '';
+  /*
+   * 覆盖率缺失时（老记录、或从备份导入的）按「译得动」算 ——
+   * 宁可多标一个「译」，也不要给用户一堆没来由的「半」。
+   */
+  const cov = Number(rec?.titleCoverage);
+  const full = Number.isFinite(cov) ? cov >= FULL_COVERAGE : true;
+  // 只有术语表产出的译文才挂角标；将来若支持手工译名，手工的不该标成「机器译」
+  const badge = rec?.titleSrc === 'glossary' ? (full ? 'full' : 'part') : '';
+
+  if (mode === 'zh-ja') {
+    return { main: zh, sub: ja, hover, badge, translated: true };
   }
-  return { main: zh, sub: ja, badge, translated: true };
+  return { main: zh, sub: '', hover, badge, translated: true };
+}
+
+
+/* ==================================================================
+ * core/storage.js
+ * ================================================================== */
+
+/**
+ * 本地标签库（IndexedDB 存储层）
+ * ------------------------------------------------------------------
+ * 方案 C 的核心：标签不打回 115，而是存在浏览器本地。
+ *
+ * 五张表：
+ *   meta     番号 -> 影片元数据（标题/演员/厂商/封面/标签）
+ *   fileMap  115 文件 ID -> 番号 的映射（含文件名快照，用于变更检测）
+ *   library  「收录」结果：一个视频文件一条，含 cid / 番号 / 演员 / 类别
+ *            —— 这是「资料库」页签的数据源，支持按演员、类别筛选
+ *   dirs     每个收录过的目录的汇总（收录时间 / 条目数 / 上次新增多少）
+ *            —— 「增量收录」的依据：同一目录再收一次时，靠它和 library
+ *               对照，只对「新文件」和「上次没抓到标签的」发请求
+ *   settings 键值配置（api key、并发数、数据源开关等）
+ *
+ * 数据完全本地，支持导出/导入 JSON 备份，清缓存前请先导出。
+ */
+
+// 统计口径要用到「译得动」的覆盖率门槛（bundler 会把 glossary.js 排在前面）
+
+const DB_NAME = 'jv115-tagger';
+/**
+ * ⚠️ 升级版本号时，onupgradeneeded 会整体重跑。
+ * 里面每个建表动作都用 `contains` 包住，所以老表及其数据不受影响，
+ * 只有新增的表会被创建。绝对不要在 upgrade 里 drop 既有表。
+ */
+const DB_VERSION = 3;
+const STORE_META = 'meta';
+const STORE_FILEMAP = 'fileMap';
+const STORE_LIBRARY = 'library';
+const STORE_DIRS = 'dirs';
+const STORE_SETTINGS = 'settings';
+
+let _dbPromise = null;
+
+/** 打开数据库（单例） */
+function openDB() {
+  if (_dbPromise) return _dbPromise;
+
+  _dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+    req.onupgradeneeded = (event) => {
+      const db = event.target.result;
+
+      if (!db.objectStoreNames.contains(STORE_META)) {
+        const s = db.createObjectStore(STORE_META, { keyPath: 'code' });
+        s.createIndex('title', 'title', { unique: false });
+        s.createIndex('fetchedAt', 'fetchedAt', { unique: false });
+        s.createIndex('source', 'source', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_FILEMAP)) {
+        const s = db.createObjectStore(STORE_FILEMAP, { keyPath: 'fileId' });
+        s.createIndex('code', 'code', { unique: false });
+        s.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_LIBRARY)) {
+        const s = db.createObjectStore(STORE_LIBRARY, { keyPath: 'id' });
+        s.createIndex('code', 'code', { unique: false });
+        s.createIndex('cid', 'cid', { unique: false });
+        // multiEntry：一个文件可以有多个演员 / 多个类别，
+        // 建多值索引后可以直接按「演员A」查出所有含该演员的记录。
+        s.createIndex('actresses', 'actresses', { unique: false, multiEntry: true });
+        s.createIndex('genres', 'genres', { unique: false, multiEntry: true });
+        s.createIndex('updatedAt', 'updatedAt', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_DIRS)) {
+        const s = db.createObjectStore(STORE_DIRS, { keyPath: 'cid' });
+        s.createIndex('harvestedAt', 'harvestedAt', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_SETTINGS)) {
+        db.createObjectStore(STORE_SETTINGS, { keyPath: 'key' });
+      }
+    };
+
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+
+  return _dbPromise;
+}
+
+/** 通用事务包装 */
+async function withStore(storeName, mode, fn) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, mode);
+    const store = tx.objectStore(storeName);
+    let result;
+    try {
+      result = fn(store);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('事务被中止'));
+  });
+}
+
+/** 把 IDBRequest 转成 Promise */
+function reqToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+/* ==================== meta 表操作 ==================== */
+
+/** 缓存实现，供 MetaResolver 使用 */
+const metaCache = {
+  async get(code) {
+    const db = await openDB();
+    const tx = db.transaction(STORE_META, 'readonly');
+    return reqToPromise(tx.objectStore(STORE_META).get(code));
+  },
+  async put(meta) {
+    return putMeta(meta);
+  }
+};
+async function putMeta(meta) {
+  if (!meta || !meta.code) throw new Error('meta 缺少 code 字段');
+  const record = { ...meta, fetchedAt: meta.fetchedAt || Date.now() };
+  await withStore(STORE_META, 'readwrite', (s) => s.put(record));
+  return record;
+}
+async function putMetaBatch(list) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_META, 'readwrite');
+    const store = tx.objectStore(STORE_META);
+    list.forEach((m) => m && m.code && store.put({ ...m, fetchedAt: m.fetchedAt || Date.now() }));
+    tx.oncomplete = () => resolve(list.length);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function getMeta(code) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_META, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_META).get(code));
+}
+async function getAllMeta() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_META, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_META).getAll());
+}
+async function countMeta() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_META, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_META).count());
+}
+async function deleteMeta(code) {
+  return withStore(STORE_META, 'readwrite', (s) => s.delete(code));
+}
+
+/* ==================== fileMap 表操作 ==================== */
+
+/**
+ * 记录「115 文件 -> 番号」映射。
+ * 存 nameSnapshot 是为了检测文件是否被改名/替换。
+ */
+async function putFileMap({ fileId, code, fileName, confidence }) {
+  const record = {
+    fileId: String(fileId),
+    code,
+    fileName,
+    nameSnapshot: fileName,
+    confidence: confidence ?? 0,
+    updatedAt: Date.now()
+  };
+  await withStore(STORE_FILEMAP, 'readwrite', (s) => s.put(record));
+  return record;
+}
+async function putFileMapBatch(list) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILEMAP, 'readwrite');
+    const store = tx.objectStore(STORE_FILEMAP);
+    list.forEach((r) => {
+      store.put({
+        fileId: String(r.fileId),
+        code: r.code,
+        fileName: r.fileName,
+        nameSnapshot: r.fileName,
+        confidence: r.confidence ?? 0,
+        updatedAt: Date.now()
+      });
+    });
+    tx.oncomplete = () => resolve(list.length);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function getFileMap(fileId) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_FILEMAP, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_FILEMAP).get(String(fileId)));
+}
+async function getAllFileMap() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_FILEMAP, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_FILEMAP).getAll());
+}
+async function countFileMap() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_FILEMAP, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_FILEMAP).count());
+}
+
+/* ==================== library 表操作（资料库） ==================== */
+
+/**
+ * 把 meta（可能是 null / notFound）+ 文件信息组装成一条 library 记录。
+ *
+ * id 用 `cid@@fileName`：
+ *   - 同名的文件在不同目录下是两个条目，不会被互相覆盖
+ *   - 目录内改名会变成新条目（旧的留给用户手动清理）
+ *
+ * @param {object} p
+ * @param {object|null} p.prev 同一文件的**上一条记录**（增量收录时传入）。
+ *   作用：① 保留 firstSeenAt（首次见到的时间）；② 新一次没抓到标签时
+ *   不把已有的标签覆盖掉（数据源偶尔抽风不该让库里的信息变少）。
+ */
+function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirIndex, code, meta, confidence, prev = null }) {
+  const cleanArr = (v) => {
+    if (!Array.isArray(v)) return [];
+    return [...new Set(v.map((x) => String(x ?? '').trim()).filter(Boolean))];
+  };
+  const now = Date.now();
+
+  const fresh = meta && !meta.notFound;
+  // 同一个番号、上次拿到了标签、这次却没拿到 → 保留旧数据，别让信息退化
+  const keepPrev = !fresh && prev && prev.matched && prev.code === (code || '');
+  const src = fresh ? meta : (keepPrev ? prev : null);
+
+  return {
+    id: `${cid || ''}@@${fileName}`,
+    cid: String(cid || ''),
+    fileName: String(fileName || ''),
+    fileId: fileId ? String(fileId) : (keepPrev ? prev.fileId : null),
+    // pickcode 是 115 播放接口唯一需要的参数，收录时能挖到就一定要存下来
+    pickcode: pickcode ? String(pickcode) : (keepPrev ? prev.pickcode : null),
+    size: size || (keepPrev ? prev.size : ''),
+    // 该文件在整个目录清单里的位置（含文件夹）。
+    // 115 网页每页只渲染 24 条，点播放时要靠它算「该翻到第几页」，
+    // 否则 78 页的目录里点一条第 50 页的文件会「跳回目录但找不到」。
+    dirIndex: Number.isFinite(dirIndex) ? dirIndex : (prev && Number.isFinite(prev.dirIndex) ? prev.dirIndex : null),
+    code: code || '',
+    confidence: confidence ?? 0,
+    title: src ? (src.title || '') : '',
+    /*
+     * 中文标题（术语表翻译）。跟 title 一样从元数据抄一份到条目上 ——
+     * 列表渲染读的是 library 记录，不抄的话译文要等下次收录才看得到。
+     * 翻译本身是按「番号」缓存在 meta 表里的，这里只是个副本。
+     */
+    titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
+    titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
+    /*
+     * 译文覆盖率（0~1）。用来区分「译得动」和「只译到一两个词」——
+     * 没有这个数就只能知道「有没有译文」，而一条 56% 覆盖率的标题
+     * 在界面上看起来和完整译名没区别，用户只会觉得「根本没翻译」。
+     */
+    titleCoverage: Number.isFinite(src?.titleCoverage)
+      ? src.titleCoverage
+      : (keepPrev ? prev.titleCoverage : undefined),
+    actresses: src ? cleanArr(src.actresses) : [],
+    genres: src ? cleanArr(src.genres) : [],
+    cover: src ? (src.cover || '') : '',
+    source: src ? (src.source || '') : '',
+    matched: !!(fresh || keepPrev),
+    keptPrev: keepPrev,
+    // 增量收录用：gone=true 表示「上次收录过，这次目录里已经没有了」
+    gone: false,
+    firstSeenAt: (prev && prev.firstSeenAt) || now,
+    lastSeenAt: now,
+    harvestedAt: (prev && prev.harvestedAt) || now,
+    updatedAt: now
+  };
+}
+async function putLibraryBatch(list) {
+  if (!list || !list.length) return 0;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
+    const store = tx.objectStore(STORE_LIBRARY);
+    list.forEach((r) => r && r.id && store.put(r));
+    tx.oncomplete = () => resolve(list.length);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function getAllLibrary() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_LIBRARY, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_LIBRARY).getAll());
+}
+async function countLibrary() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_LIBRARY, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_LIBRARY).count());
+}
+
+/**
+ * 取某个目录下已经收录的条目（走 cid 索引）。
+ * 增量收录的第一步：拿它和接口返回的当前文件清单对照，
+ * 就能算出「新增 / 未变 / 已失效」三类。
+ */
+async function getLibraryByCid(cid) {
+  const key = String(cid || '');
+  if (!key) return [];
+  const db = await openDB();
+  const tx = db.transaction(STORE_LIBRARY, 'readonly');
+  const idx = tx.objectStore(STORE_LIBRARY).index('cid');
+  return reqToPromise(idx.getAll(key));
+}
+
+/** 统计「已失效」条目数（文件已从 115 目录里消失） */
+async function countLibraryGone() {
+  const all = await getAllLibrary();
+  return all.filter((r) => r.gone).length;
+}
+
+/** 删除全部「已失效」条目，返回删掉的条数 */
+async function deleteLibraryGone() {
+  const all = await getAllLibrary();
+  const gone = all.filter((r) => r.gone);
+  if (!gone.length) return 0;
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
+    const store = tx.objectStore(STORE_LIBRARY);
+    gone.forEach((r) => store.delete(r.id));
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  return gone.length;
+}
+
+/* ==================== dirs 表操作 ==================== */
+
+/**
+ * 记录/更新一个目录的收录汇总。
+ * 只存「轻量元信息」，不存文件清单本身（清单就在 library 表里）。
+ */
+async function putDirMeta(rec) {
+  if (!rec || !rec.cid) throw new Error('dirs 记录缺少 cid');
+  return withStore(STORE_DIRS, 'readwrite', (s) => s.put({
+    ...rec,
+    cid: String(rec.cid),
+    harvestedAt: rec.harvestedAt || Date.now()
+  }));
+}
+async function getDirMeta(cid) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_DIRS, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_DIRS).get(String(cid || '')));
+}
+async function getAllDirs() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_DIRS, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_DIRS).getAll());
+}
+async function countDirs() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_DIRS, 'readonly');
+  return reqToPromise(tx.objectStore(STORE_DIRS).count());
+}
+async function deleteLibrary(id) {
+  return withStore(STORE_LIBRARY, 'readwrite', (s) => s.delete(id));
+}
+async function clearLibrary() {
+  return withStore(STORE_LIBRARY, 'readwrite', (s) => s.clear());
+}
+
+/**
+ * 清理「同一个文件但 id 不同」的旧记录，返回删掉的条数。
+ *
+ * 为什么需要：id = `cid@@fileName`，所以 cid 一旦变化，同一部片会算出两个 id。
+ * 典型场景就是「cid 取值方式修好后重新收录」—— 旧记录里带着错的 cid
+ * （比如 0），不清理就会同一部片在资料库里出现两条。
+ *
+ * @param {Array} keepRecords 本次刚写入的记录，它们的 id 视为最新
+ */
+async function pruneLibraryDuplicates(keepRecords) {
+  if (!keepRecords || !keepRecords.length) return 0;
+  const keepIds = new Set(keepRecords.map((r) => r.id));
+  const names = new Set(keepRecords.map((r) => r.fileName).filter(Boolean));
+  if (!names.size) return 0;
+
+  const all = await getAllLibrary();
+  const stale = all.filter((r) => names.has(r.fileName) && !keepIds.has(r.id));
+  if (!stale.length) return 0;
+
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_LIBRARY, 'readwrite');
+    const store = tx.objectStore(STORE_LIBRARY);
+    stale.forEach((r) => store.delete(r.id));
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  return stale.length;
+}
+
+/**
+ * 取一条记录的译文覆盖率。
+ *
+ * 没这个字段的记录（v1.4.0 存下来的，当时只存了译文本身）按「译得动」算 ——
+ * 不确定的时候宁可归到「能读」，也不要凭空给用户一堆「半译」。
+ * 升到 GLOSSARY_VERSION 2 之后重译一次，这个字段就会补齐。
+ */
+function covOf(r) {
+  const c = Number(r?.titleCoverage);
+  return Number.isFinite(c) ? c : 1;
+}
+
+/**
+ * 汇总可筛选的维度：演员 / 类别 / 目录。
+ * 供资料库页签生成筛选 chips（带出现次数，按次数降序）。
+ */
+async function getLibraryFacets() {
+  const allRaw = await getAllLibrary();
+  // 失效条目（文件已不在 115 目录里）默认不参与筛选维度统计
+  const gone = allRaw.filter((r) => r.gone).length;
+  const all = allRaw.filter((r) => !r.gone);
+  const tally = (pick) => {
+    const m = new Map();
+    all.forEach((r) => {
+      pick(r).forEach((v) => m.set(v, (m.get(v) || 0) + 1));
+    });
+    return [...m.entries()]
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  };
+  return {
+    total: all.length,
+    gone,
+    /*
+     * 标题中译的完成度分档。
+     * ★ v1.4.0 用的是「只要有改动就算已译」，结果一条只译对一个词的标题
+     *   也计入「已译」，面板显示「已译 3293 条」而列表看着像没生效。
+     *   现在按覆盖率分三档，让用户一眼看出真正能读的有多少。
+     */
+    trFull: all.filter((r) => r.titleZh && covOf(r) >= FULL_COVERAGE).length,
+    trPart: all.filter((r) => r.titleZh && covOf(r) < FULL_COVERAGE).length,
+    trNone: all.filter((r) => !r.titleZh).length,
+    actresses: tally((r) => r.actresses || []),
+    genres: tally((r) => r.genres || []),
+    cids: tally((r) => (r.cid ? [r.cid] : []))
+  };
+}
+
+/**
+ * 把「番号 → 中文标题」写回 meta，并同步到所有引用它的资料库条目。
+ *
+ * 为什么必须同步两处：
+ *   - `meta` 是翻译的**存放处**（按番号缓存，同一部片只译一次）
+ *   - `library` 是列表**渲染时的数据源**（它存的是副本）
+ *   只写 meta 的话，列表里看不到译文，得重收一次目录才生效 —— 那个体验很差。
+ */
+async function applyTitleZhBatch(entries) {
+  if (!entries || !entries.length) return { meta: 0, library: 0 };
+  const db = await openDB();
+  const byCode = new Map();
+  for (const e of entries) if (e && e.code) byCode.set(String(e.code), e);
+  if (!byCode.size) return { meta: 0, library: 0 };
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_META, STORE_LIBRARY], 'readwrite');
+    const metaStore = tx.objectStore(STORE_META);
+    const libStore = tx.objectStore(STORE_LIBRARY);
+    let metaHits = 0;
+    let libHits = 0;
+
+    // ① 元数据：按 code 取回来合并。取不到就跳过 —— 不凭空造记录
+    for (const [code, e] of byCode) {
+      const req = metaStore.get(code);
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (cur) { metaStore.put(Object.assign({}, cur, e)); metaHits++; }
+      };
+    }
+
+    // ② 资料库：把译文抄到每个同番号的条目上
+    const all = libStore.getAll();
+    all.onsuccess = () => {
+      for (const r of all.result || []) {
+        const e = byCode.get(String(r.code || ''));
+        if (!e) continue;
+        /*
+         * 原文没变、译名和覆盖率也没变 → 不必写回（省 I/O）。
+         * ★ 覆盖率也要比：只比译文的话，老记录补覆盖率这一步会被跳过，
+         *   列表就永远拿不到「译得动 / 只译了一半」的区分。
+         */
+        if (
+          r.titleZh === e.titleZh &&
+          r.titleHash === e.titleHash &&
+          r.titleCoverage === e.titleCoverage
+        ) continue;
+        libStore.put(Object.assign({}, r, {
+          titleZh: e.titleZh,
+          titleSrc: e.titleSrc,
+          titleHash: e.titleHash,
+          titleCoverage: e.titleCoverage
+        }));
+        libHits++;
+      }
+    };
+
+    tx.oncomplete = () => resolve({ meta: metaHits, library: libHits });
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/**
+ * 纯函数版筛选 —— 不碰数据库，便于单元测试。
+ * 规则：
+ *   - 关键词：大小写不敏感，命中番号/标题/文件名/演员/类别 任一即可
+ *   - 演员/类别：多选时是 **AND**（要同时满足所有选中项）
+ *     —— 选「演员A」+「演员B」表示「同时有这两个演员的作品」
+ *   - hideGone：默认隐藏「已失效」条目（文件已从 115 目录消失）
+ */
+function filterLibraryRows(all, {
+  keyword = '', actresses = [], genres = [], cid = '', hideGone = true
+} = {}) {
+  const kw = String(keyword || '').trim().toLowerCase();
+
+  return (all || []).filter((r) => {
+    if (hideGone && r.gone) return false;
+    if (cid && r.cid !== cid) return false;
+    if (actresses.length && !actresses.every((a) => (r.actresses || []).includes(a))) return false;
+    if (genres.length && !genres.every((g) => (r.genres || []).includes(g))) return false;
+    if (!kw) return true;
+    const hay = [r.code, r.title, r.fileName, ...(r.actresses || []), ...(r.genres || [])]
+      .join(' ')
+      .toLowerCase();
+    return hay.includes(kw);
+  }).sort((a, b) =>
+    String(a.code || '').localeCompare(String(b.code || '')) ||
+    String(a.fileName || '').localeCompare(String(b.fileName || ''))
+  );
+}
+
+/** 在库内按关键词 + 演员/类别筛选（先从 IDB 取全量，再走纯函数过滤） */
+async function queryLibrary(filters = {}) {
+  const all = await getAllLibrary();
+  return filterLibraryRows(all, filters);
+}
+
+/* ==================== settings 表操作 ==================== */
+async function setSetting(key, value) {
+  return withStore(STORE_SETTINGS, 'readwrite', (s) => s.put({ key, value }));
+}
+async function getSetting(key, defaultValue = null) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_SETTINGS, 'readonly');
+  const row = await reqToPromise(tx.objectStore(STORE_SETTINGS).get(key));
+  return row ? row.value : defaultValue;
+}
+async function getAllSettings() {
+  const db = await openDB();
+  const tx = db.transaction(STORE_SETTINGS, 'readonly');
+  const rows = await reqToPromise(tx.objectStore(STORE_SETTINGS).getAll());
+  return rows.reduce((acc, r) => ({ ...acc, [r.key]: r.value }), {});
+}
+
+/**
+ * 「播放」按钮的默认地址模板（唯一权威定义，main.js / panel.js 都从这里引）。
+ * 可用变量：{pickcode} {cid} {fileId} {name}
+ *
+ * 取值来源：115Master 公开的播放器唤起接口。
+ * 若在未安装 115Master 的环境下打不开，可在「设置」页改成自己环境可用的地址。
+ *
+ * ⚠️ 打包器会把所有模块拼进同一个作用域，所以这个名字全局只能出现一次。
+ */
+const DEFAULT_PLAYER_URL =
+  'https://115.com/web/lixian/master/video/?pick_code={pickcode}&cid={cid}';
+
+/**
+ * 播放方式。
+ *
+ *   PAGE   —— 点「播放」直接开播放页（一步直达，默认）
+ *   INPAGE —— 跳回该文件所在目录，在网页列表里定位并模拟点击播放
+ *
+ * 为什么默认是 PAGE 而不是「自动检测」：
+ *   115Master 的 DOM 标记（#master-app / x-player）**只在播放页挂载**，
+ *   文件列表页上根本不存在。所以在列表页做「装没装 115Master」的检测
+ *   必然返回 false —— 旧版的 auto 模式等于被强制降级成 INPAGE，
+ *   用户看到的现象就是「点了播放却跳回目录，还找不到视频」。
+ *   与其猜，不如直接开播放页；开出来是不是空白由「播放页自检」事后判定。
+ */
+const PLAY_MODES = { PAGE: 'page', INPAGE: 'inpage' };
+
+/** 把历史/非法值归一化为当前支持的播放方式 */
+function normalizePlayMode(v) {
+  if (v === PLAY_MODES.INPAGE) return PLAY_MODES.INPAGE;
+  // 历史值：'auto'（在列表页恒判 false，等于强制模拟点击）、'master'（开播放页）
+  return PLAY_MODES.PAGE;
+}
+
+/**
+ * 从一条资料库记录里取模板变量（纯函数，便于单测）。
+ *
+ * {name} = 去掉扩展名的文件名。留给「用搜索页接文件」这类自定义模板，
+ * 默认模板用不到它。
+ */
+function playerTemplateVars(row = {}) {
+  return {
+    pickcode: row.pickcode || '',
+    cid: row.cid || '',
+    fileId: row.fileId || '',
+    name: String(row.fileName || '').replace(/\.[a-z0-9]{2,5}$/i, '')
+  };
+}
+
+/**
+ * 按模板拼播放地址（纯函数，便于单测）。
+ *
+ * 模板里写了但没提供的变量**保持原样**，不替换成空串 ——
+ * 这样用户一眼就能看出「{foo} 这个变量不存在」，比拼出一个残缺 URL 好排查。
+ */
+function fillPlayerTemplate(tpl, vars = {}) {
+  return String(tpl || '').replace(/\{(\w+)\}/g, (m, k) =>
+    Object.prototype.hasOwnProperty.call(vars, k) ? encodeURIComponent(vars[k]) : m
+  );
+}
+
+/**
+ * 播放页自检结果的存放键。
+ *
+ * 脚本在**播放页**里也会运行，那一侧才检测得准。
+ * 判定结果写进 localStorage，列表页打开播放页前先读一眼：
+ * 上次如果是空白页，就先提醒用户，不要让他对着白屏发呆。
+ */
+const PLAYER_PROBE_KEY = 'jv115-player-probe';
+/** 自检结果的有效期（ms）：超过就重新判一次，避免用户后来装了 115Master 还一直报错 */
+const PLAYER_PROBE_TTL = 10 * 60 * 1000;
+const DEFAULT_SETTINGS = {
+  // 数据源（默认全部走网页直连，不需要任何 key）
+  enableJavbus: true,
+  javbusBaseUrl: 'https://www.javbus.com',
+  enableJavlibrary: true,
+  javlibraryBaseUrl: 'https://www.javlibrary.com',
+  javlibraryLang: 'cn',
+  // DMM 可选（有 key 才启用）
+  enableDmm: false,
+  dmmApiId: '',
+  dmmAffiliateId: '',
+  // 行为
+  concurrency: 3,
+  useCache: true,
+  autoInjectColumn: true,
+  cacheTTLDays: 30,
+  minConfidence: 60,
+  showCover: false,
+  // 悬停浮层空间充裕 → 0 表示全显示，不截断
+  maxActress: 0,
+  maxGenres: 0,
+  /**
+   * 点「播放」时怎么打开（取值见上方 PLAY_MODES）：
+   *   'page'   直接打开播放页（一步直达，默认）
+   *   'inpage' 跳回目录 + 页面内模拟点击播放（不依赖任何插件，但受分页/渲染影响）
+   */
+  playMode: PLAY_MODES.PAGE,
+  /** 「播放」按钮的地址模板，见文件上方 DEFAULT_PLAYER_URL 的说明 */
+  playerUrlTemplate: DEFAULT_PLAYER_URL,
+  /**
+   * 标题中译（见 core/glossary.js）。
+   * 纯本地术语表，不联网、不花钱、没有内容审核问题。
+   * 自动模式：每次查询元数据后顺手把新标题译掉，用户不用手动点。
+   */
+  autoTranslateTitles: true,
+  /**
+   * 资料库列表里标题怎么显示：
+   *   'zh'    只显示中文一行，原文放到鼠标悬停（默认）
+   *   'zh-ja' 中文一行 + 原文一行（想常驻对照时再切）
+   *   'ja'    只显示原文
+   */
+  titleDisplay: 'zh'
+};
+async function loadSettings() {
+  const saved = await getAllSettings();
+  const merged = { ...DEFAULT_SETTINGS, ...saved };
+  // 历史存档里可能是 'auto'/'master'，这里统一迁移，面板上的下拉才不会空掉
+  merged.playMode = normalizePlayMode(merged.playMode);
+  if (!merged.playerUrlTemplate) merged.playerUrlTemplate = DEFAULT_PLAYER_URL;
+  return merged;
+}
+
+/* ==================== 导出 / 导入 ==================== */
+
+/** 导出全部数据为 JSON 字符串 */
+async function exportAll() {
+  const [meta, fileMap, library, dirs, settings] = await Promise.all([
+    getAllMeta(),
+    getAllFileMap(),
+    getAllLibrary(),
+    getAllDirs(),
+    getAllSettings()
+  ]);
+  return JSON.stringify(
+    {
+      _format: 'jv115-tagger-backup',
+      _version: DB_VERSION,
+      _exportedAt: new Date().toISOString(),
+      meta,
+      fileMap,
+      library,
+      dirs,
+      settings
+    },
+    null,
+    2
+  );
+}
+
+/**
+ * 导入备份。默认合并（同 key 覆盖）。
+ * @param {string} jsonText
+ * @param {{merge?: boolean}} opts merge=false 时先清空
+ */
+async function importAll(jsonText, opts = {}) {
+  const data = JSON.parse(jsonText);
+  if (data._format !== 'jv115-tagger-backup') {
+    throw new Error('备份文件格式不匹配');
+  }
+
+  if (opts.merge === false) {
+    await clearAll();
+  }
+
+  const metaCount = await putMetaBatch(data.meta || []);
+  const mapCount = await putFileMapBatch(data.fileMap || []);
+  const libCount = await putLibraryBatch(data.library || []);
+
+  let dirCount = 0;
+  for (const d of data.dirs || []) {
+    if (d && d.cid) { await putDirMeta(d); dirCount++; }
+  }
+
+  let settingCount = 0;
+  if (data.settings) {
+    for (const [key, value] of Object.entries(data.settings)) {
+      await setSetting(key, value);
+      settingCount++;
+    }
+  }
+
+  return { metaCount, mapCount, libCount, dirCount, settingCount };
+}
+
+/** 清空所有业务数据（不含设置） */
+async function clearAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_META, STORE_FILEMAP, STORE_LIBRARY, STORE_DIRS], 'readwrite');
+    tx.objectStore(STORE_META).clear();
+    tx.objectStore(STORE_FILEMAP).clear();
+    tx.objectStore(STORE_LIBRARY).clear();
+    tx.objectStore(STORE_DIRS).clear();
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/** 清理超过 TTL 的缓存条目 */
+async function purgeExpired(ttlDays = 30) {
+  const cutoff = Date.now() - ttlDays * 86400 * 1000;
+  const all = await getAllMeta();
+  const expired = all.filter((m) => (m.fetchedAt || 0) < cutoff);
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_META, 'readwrite');
+    const store = tx.objectStore(STORE_META);
+    expired.forEach((m) => store.delete(m.code));
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+  return expired.length;
+}
+
+/** 获取统计信息 */
+async function getStats() {
+  const [metaCount, mapCount, libCount, dirCount] = await Promise.all([
+    countMeta(),
+    countFileMap(),
+    countLibrary(),
+    countDirs()
+  ]);
+  const all = await getAllMeta();
+  const bySource = all.reduce((acc, m) => {
+    acc[m.source] = (acc[m.source] || 0) + 1;
+    return acc;
+  }, {});
+  const goneCount = await countLibraryGone();
+  return { metaCount, mapCount, libCount, dirCount, goneCount, bySource };
+}
+
+
+/* ==================================================================
+ * core/paging.js
+ * ================================================================== */
+
+/**
+ * 资料库列表的分批渲染（懒加载）
+ * ------------------------------------------------------------------
+ * 为什么需要它：
+ *   命中几千条时一次性塞进 DOM 会卡；更要命的是**用户看不见「下面还有多少」** ——
+ *   旧实现是 `rows.slice(0, 300)` 静默截断，既不说截断了、也没法继续看，
+ *   观感就是「筛选完显示不全，也没有翻页」。
+ *
+ * 现在的做法：
+ *   · 先渲染前 LIB_PAGE_SIZE 条；
+ *   · 滚到底部（footer 进入视口）自动追加下一批；
+ *   · 底部常驻一行状态，写明「已显示 X / 共 Y 条」或「已全部显示」。
+ *
+ * 这里只放**纯计算**（方便单测）；DOM 操作在 panel.js 里。
+ * ⚠️ 打包器把所有模块拼进同一作用域，常量名全局唯一。
+ */
+
+/** 每批渲染多少条（用户要求：默认显示 50 条） */
+const LIB_PAGE_SIZE = 50;
+
+/**
+ * 算出下一批要渲染的区间。
+ *
+ * @param {number} total 本次筛选命中的总条数
+ * @param {number} shown 已经渲染了多少条
+ * @param {number} [size] 每批条数
+ * @returns {{from:number, to:number, added:number, hasMore:boolean}}
+ *          from/to 为 [from, to) 左闭右开区间；added 是本批新增条数
+ */
+function libPageWindow(total, shown, size = LIB_PAGE_SIZE) {
+  // 容错：任何非数字/负数/越界的输入都要夹到合法区间，绝不能算出 NaN 让 slice 静默返回空数组
+  const t = Math.max(0, Math.floor(Number(total)) || 0);
+  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
+
+  /*
+   * size 非法（NaN / 0 / 负数）一律**回落默认值**。
+   * ⚠️ 不能写成 `Math.max(1, size || DEFAULT)`：负数是 truthy，
+   *    会被 max 抬成 1 —— 退化成「一次一条」，比报错还难发现。
+   */
+  const rawStep = Math.floor(Number(size));
+  const step = Number.isFinite(rawStep) && rawStep > 0 ? rawStep : LIB_PAGE_SIZE;
+
+  const from = s;
+  const to = Math.min(from + step, t);
+  return { from, to, added: to - from, hasMore: to < t };
+}
+
+/**
+ * 底部状态行文案。
+ *
+ * 关键点：**加载完必须明确说「已全部显示」**。
+ * 否则用户滚到底看到没有新内容，仍会怀疑「是不是还有没加载出来的」——
+ * 这正是这次要修的观感问题。
+ *
+ * @param {number} total 命中总数
+ * @param {number} shown 已渲染条数
+ * @param {boolean} [loading] 是否正在加载
+ * @returns {string} 空串表示不需要 footer
+ */
+function libFootText(total, shown, loading = false) {
+  const t = Math.max(0, Math.floor(Number(total)) || 0);
+  const s = Math.min(Math.max(0, Math.floor(Number(shown)) || 0), t);
+
+  if (t === 0) return '';
+  if (loading) return `正在加载… 已显示 ${s} / ${t} 条`;
+  if (s >= t) return `已全部显示（共 ${t} 条）`;
+  return `已显示 ${s} / 共 ${t} 条 · 继续下滑自动加载`;
 }
 
 
@@ -2674,12 +2747,18 @@ input:focus, select:focus { border-color: #2b5cff; }
   overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
-/* 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗 */
+/*
+ * 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗。
+ * v1.4.1 起默认不再显示这一行（原文改到鼠标悬停），只有把显示方式切成
+ * 「中文一行 + 原文一行」时才用得上。
+ */
 .lib-item .ttl-ja {
   font-size: 11px; color: #9aa3b2; margin-top: 1px; line-height: 1.4;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 「译」= 这份译文基本能读；「半」= 只译到一部分，剩下的还是日文 */
 .lib-item .badge.tr { background: #eef2ff; color: #2b5cff; border: 1px solid #ccd8ff; }
+.lib-item .badge.tr.half { background: #fdf6e8; color: #8a6d3b; border-color: #f0e0c0; }
 .lib-item .tags {
   font-size: 11px; color: #8a94a6; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -5398,8 +5477,8 @@ const PANEL_HTML = `
       <div class="row">
         <label style="width:96px">标题显示</label>
         <select class="grow" id="cfgTitleDisplay">
-          <option value="zh-ja">中文主行 + 原文副行（推荐）</option>
-          <option value="zh">只显示中文</option>
+          <option value="zh">只显示中文（原文放悬停，推荐）</option>
+          <option value="zh-ja">中文一行 + 原文一行</option>
           <option value="ja">只显示原文</option>
         </select>
       </div>
@@ -5622,8 +5701,8 @@ function createPanel(handlers = {}) {
     $('#cfgPlayerUrl').value = cfg.playerUrlTemplate || DEFAULT_PLAYER_URL;
     $('#cfgPlayMode').value = cfg.playMode === 'inpage' ? 'inpage' : 'page';
     // 标题中译
-    const modes = ['zh-ja', 'zh', 'ja'];
-    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh-ja';
+    const modes = ['zh', 'zh-ja', 'ja'];
+    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh';
     $('#cfgAutoTranslate').checked = cfg.autoTranslateTitles !== false;
     const gv = $('#cfgGlossaryVer');
     if (gv) gv.textContent = `v${GLOSSARY_VERSION} · ${glossarySize()} 词条`;
@@ -5654,7 +5733,7 @@ function createPanel(handlers = {}) {
     await setSetting('playMode', $('#cfgPlayMode').value === 'inpage' ? 'inpage' : 'page');
     // 标题中译
     const td = $('#cfgTitleDisplay').value;
-    await setSetting('titleDisplay', ['zh-ja', 'zh', 'ja'].includes(td) ? td : 'zh-ja');
+    await setSetting('titleDisplay', ['zh', 'zh-ja', 'ja'].includes(td) ? td : 'zh');
     await setSetting('autoTranslateTitles', $('#cfgAutoTranslate').checked);
     toast('设置已保存', 'ok');
     handlers.onSettingsChanged?.();
@@ -5752,7 +5831,7 @@ function createPanel(handlers = {}) {
    * 不需要为每个维度建查询计划。
    * ================================================================ */
   // titleMode：标题显示方式，渲染前从设置里读一次（见 applyLibFilter）
-  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh-ja' };
+  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh' };
 
   /** 重新从库里读一次，并刷新下拉筛选器 + 列表 */
   async function loadLibrary() {
@@ -5955,17 +6034,27 @@ function createPanel(handlers = {}) {
     else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
 
     /*
-     * v1.4.0：中文标题作主行，原日文降为副行。
-     * 原文**不丢** —— 术语表翻译是机器产物，只当索引用，原文才是权威。
+     * v1.4.1：默认只显示**一行中文**，原文放进 `title` 属性（鼠标悬停才看）。
+     * 术语表翻译是机器产物、只当索引用，原文才是权威 —— 但让原文常驻第二行，
+     * 列表每条都占两行，扫起来反而费劲（v1.4.0 就是这么做的，实测不好用）。
      * 没有译文时老实退回原文（`titleDisplayParts` 里保证不留空白）。
+     *
+     * 角标分「译 / 半」：只译到一两个词的标题不再冒充完整译名。
+     * v1.4.0 一律标「译」，于是 56% 覆盖率的标题看着和译好的没区别，
+     * 用户的结论只能是「根本没翻译」。
      */
     const t = titleDisplayParts(r, libState.titleMode);
-    const zhBadge = t.badge
+    const cov = Number(r.titleCoverage);
+    const pct = Number.isFinite(cov) ? Math.round(cov * 100) : null;
+    const zhBadge = t.badge === 'full'
       ? '<span class="badge tr" title="本地术语表翻译，非官方译名">译</span>'
-      : '';
+      : t.badge === 'part'
+        ? `<span class="badge tr half" title="只译到一部分${pct == null ? '' : `（约 ${pct}%）`}，剩下的仍是日文 —— 术语表翻不掉长句里的动词活用和助词">半</span>`
+        : '';
     const subLine = t.sub
       ? `<div class="ttl-ja" title="原日文标题">${escapeHtml(t.sub)}</div>`
       : '';
+    const ttlTip = t.hover ? `原日文标题：${t.hover}` : t.main;
 
     const playTitle = r.pickcode
       ? '在新标签页打开播放页'
@@ -5974,7 +6063,7 @@ function createPanel(handlers = {}) {
     return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
       <div class="mid">
         <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-        <div class="ttl" title="${escapeHtml(t.main)}">${escapeHtml(t.main)}${zhBadge}</div>
+        <div class="ttl" title="${escapeHtml(ttlTip)}">${escapeHtml(t.main)}${zhBadge}</div>
         ${subLine}
         <div class="tags">${tagLine}</div>
       </div>
@@ -6068,7 +6157,7 @@ function createPanel(handlers = {}) {
       });
       // 每次渲染前读一次显示方式：用户在设置里改完，回到列表就能生效
       const cfg = await loadSettings();
-      libState.titleMode = cfg.titleDisplay || 'zh-ja';
+      libState.titleMode = cfg.titleDisplay || 'zh';
     } catch (e) {
       toast(`筛选失败：${e.message}`, 'err');
       return;
@@ -6080,10 +6169,17 @@ function createPanel(handlers = {}) {
     // 缺提取码 = 点「播放」也开不了播放页的那批（收录一次即可补全）
     const noPc = rows.filter((r) => !r.pickcode && !r.gone).length;
     const filtered = rows.length !== total;
-    // 已译：有一定比例才报，免得全是 0 时刷屏
-    const translated = libState.facets ? (libState.facets.translated || 0) : 0;
-    const transTip = translated
-      ? ` · <span style="color:#2b5cff">已译 ${translated} 条</span>`
+    /*
+     * 标题中译的完成度按三档报。
+     * ★ 别退回「已译 N 条」这种口径 —— 只要有一处改动就算「已译」的话，
+     *   一条只把「同窓会」译成「同窗会」、其余全是日文的标题也算译好了，
+     *   面板显示「已译 3293 条」而列表看着像没生效，两边都没说谎。
+     */
+    const trFull = libState.facets ? (libState.facets.trFull || 0) : 0;
+    const trPart = libState.facets ? (libState.facets.trPart || 0) : 0;
+    const transTip = trFull || trPart
+      ? ` · 中译 <span style="color:#2b5cff">译得动 ${trFull}</span>`
+        + ` · <span style="color:#8a6d3b">半译 ${trPart}</span>`
       : '';
     $('#libStat').innerHTML =
       `资料库共 <b>${total}</b> 条` +
@@ -6761,20 +6857,31 @@ async function translateTitles(force = false, { silent = false } = {}) {
   const entries = [];
   let changed = 0;
   let missed = 0;
+  let full = 0;
 
   for (let i = 0; i < todo.length; i++) {
     const m = todo[i];
     const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
+    /*
+     * 只要有一处改动就存译文 —— 这是有意的：
+     * 半译总比不译强，用户至少能认出「同窓会」是「同窗会」。
+     * 但**必须同时存覆盖率**，否则界面上分不出「译得动」和「只译到一两个词」，
+     * 一条 56% 的标题会和完整译名长得一模一样。
+     */
     entries.push({
       code: m.code,
       // 没译出来就存空串，让列表老实回退到原文，而不是存一份和原文一样的「译文」
       titleZh: r.changed ? r.zh : '',
       titleSrc: r.changed ? 'glossary' : '',
+      titleCoverage: r.changed ? Math.round(r.coverage * 1000) / 1000 : 0,
       // ★ 没命中也要记哈希：否则每次都会把同一批「没命中」的条目重新算一遍
       titleHash: hashTitle(m.title),
       titleZhAt: Date.now()
     });
-    if (r.changed) changed++; else missed++;
+    if (r.changed) {
+      changed++;
+      if (r.coverage >= FULL_COVERAGE) full++;
+    } else missed++;
     if (i % 200 === 199) {
       if (!silent) panel?.setProgress(i + 1, todo.length);
       // 让出主线程：几千条时不能把页面卡死
@@ -6785,19 +6892,27 @@ async function translateTitles(force = false, { silent = false } = {}) {
   await applyTitleZhBatch(entries);
   broadcast('render-cache');
 
-  const msg = `✅ 标题中译：${changed} 条译出 · ${missed} 条未命中（保留原文）`
+  /*
+   * 报数要如实：只说「N 条译出」会让人以为有 N 条可用，
+   * 实际其中不少只译到一两个词。所以把「译得动」单独拎出来说。
+   */
+  const part = changed - full;
+  const msg = `✅ 标题中译：${full} 条译得动 · ${part} 条只译到一部分 · ${missed} 条未命中`
     + ` · 词典 v${GLOSSARY_VERSION}（${glossarySize()} 词条）`;
   if (silent) {
     panel?.setHint(msg);
   } else {
     panel?.setBusy(false, msg);
-    panel?.setHint(missed
-      ? '未命中的那批会原样显示日文标题。想提高命中率：把常用词补进 core/glossary.js 的词典表，'
-        + '把 GLOSSARY_VERSION +1 后重新构建即可 —— 已译条目会自动重译。'
-      : '全部译出，没有残留日文。');
-    toast(`标题中译完成：${changed} 条`, 'ok');
+    panel?.setHint(
+      part || missed
+        ? '术语表是「词对词替换」，长句里剩下的动词活用和助词它翻不掉，'
+          + '所以会有「一半中文一半日文」的条目 —— 这是纯本地方案的天花板，不是没生效。'
+          + '想提高覆盖率：把常用词补进 core/glossary.js，把 GLOSSARY_VERSION +1 后重新构建，已译条目会自动重译。'
+        : '全部译出，没有残留日文。'
+    );
+    toast(`标题中译完成：${full} 条译得动 · ${part} 条半译`, 'ok');
   }
-  return { total: withTitle.length, done: todo.length, changed, missed };
+  return { total: withTitle.length, done: todo.length, changed, full, missed };
 }
 
 /**
