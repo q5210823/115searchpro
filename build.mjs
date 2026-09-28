@@ -14,7 +14,7 @@ const ROOT = path.dirname(__filename);
 const SRC = path.join(ROOT, 'src');
 const DIST = path.join(ROOT, 'dist');
 
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 
 /**
  * 依赖顺序（被依赖的放前面）

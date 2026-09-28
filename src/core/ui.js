@@ -49,7 +49,13 @@ const STYLES = `
   position: fixed;
   right: 24px; bottom: 84px;
   width: 380px;
-  max-height: 74vh;
+  /*
+   * v1.4.2：74vh → 80vh。
+   * 抽屉越矮，「资料库」列表能分到的高度就越少（筛选区 + 底部按钮是固定开销）。
+   * 抽屉 bottom 固定 84px，80vh 在 768px 高的窗口上顶部仍留 54px，
+   * 不会顶出屏幕；其它页签本来就能滚动，不受影响。
+   */
+  max-height: 80vh;
   background: #fff;
   border: 1px solid #e3e6eb;
   border-radius: 12px;
@@ -174,8 +180,34 @@ input:focus, select:focus { border-color: #2b5cff; }
  * 搜索框 + 演员/类别筛选 chips + 结果列表（每行带播放入口）。
  * 全部在 Shadow DOM 内，不受 115 页面样式影响。
  * ================================================================== */
-.lib-search { display: flex; gap: 8px; margin-bottom: 10px; }
+.lib-search { display: flex; gap: 8px; margin-bottom: 8px; }
 .lib-search input { flex: 1; min-width: 0; }
+
+/*
+ * 筛选区：演员 / 类别 并排各占一半（v1.4.2）。
+ * 竖着排要吃掉 84px，并排只要 34px —— 列表因此能多显示一条结果。
+ * 抽屉宽度固定 380px，所以这里不存在窄屏挤坏的问题。
+ */
+.lib-filters { display: flex; gap: 8px; }
+.lib-filters .dd { flex: 1; min-width: 0; margin-bottom: 0; }
+.lib-filters .dd-btn { padding: 6px 9px; gap: 6px; }
+/*
+ * 面板要给个最小宽度：按钮只有半宽（172px），演员列表塞在里面没法用。
+ * 右半边的面板必须往左展开，否则会顶出抽屉边界。
+ */
+.lib-filters .dd-panel { min-width: 258px; }
+.lib-filters .dd:last-child .dd-panel { left: auto; right: 0; }
+
+/*
+ * 统计行：钉死单行。
+ * 原来「资料库共 3869 条 · 当前筛选命中 59 条 · 其中 59 条有标签 · 中译译得动 560 …」
+ * 在 352px 内必然折成两行，白占 18px。文案缩短 + nowrap + 省略号，
+ * 无论后面再拼多少段都只占一行；完整含义放进 title。
+ */
+.lib-stat {
+  margin: 6px 0; font-size: 11px; line-height: 1.5;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ---- 下拉多选筛选器 ---- */
 .dd { position: relative; margin-bottom: 8px; }

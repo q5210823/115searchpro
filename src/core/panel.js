@@ -90,49 +90,65 @@ const PANEL_HTML = `
         <button class="btn sm" id="btnLibReload">刷新</button>
       </div>
 
-      <div class="hint" id="libStat" style="margin:0 0 10px">资料库为空，先到「扫描」页签点「📥 收录本目录」。</div>
+      <!--
+        筛选区从四行压成两行（原来约 171px，现在约 98px）。
+        抽屉是固定 380px 宽、74vh 高，筛选区每让出 1px，下面的列表就多 1px ——
+        这是「想一眼看到更多结果」最划算的地方。
 
-      <div class="dd" id="ddActress">
-        <button class="dd-btn" id="ddActressBtn">
-          <span class="lab">演员</span>
-          <span class="val none" id="ddActressVal">全部</span>
-          <span class="arrow">▼</span>
-        </button>
-        <div class="dd-panel hidden" id="ddActressPanel">
-          <input type="text" class="dd-search" id="ddActressSearch" placeholder="搜索演员…">
-          <div class="dd-opts" id="ddActressOpts"></div>
-          <div class="dd-foot">
-            <button data-act="all">全选</button>
-            <button data-act="none">清空</button>
-            <button data-act="close" class="primary">完成</button>
+        两行布局：
+          第一行 [搜索] [刷新]
+          第二行 [演员 ▾] [类别 ▾]   ← 并排各占一半
+        统计行挪到最下面，并用 CSS 钉成**单行不折行**（原来要折两行，白占 18px）。
+      -->
+      <div class="lib-filters">
+        <div class="dd" id="ddActress">
+          <button class="dd-btn" id="ddActressBtn">
+            <span class="lab">演员</span>
+            <span class="val none" id="ddActressVal">全部</span>
+            <span class="arrow">▼</span>
+          </button>
+          <div class="dd-panel hidden" id="ddActressPanel">
+            <input type="text" class="dd-search" id="ddActressSearch" placeholder="搜索演员…">
+            <div class="dd-opts" id="ddActressOpts"></div>
+            <div class="dd-foot">
+              <button data-act="all">全选</button>
+              <button data-act="none">清空</button>
+              <button data-act="close" class="primary">完成</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="dd" id="ddGenre">
+          <button class="dd-btn" id="ddGenreBtn">
+            <span class="lab">类别</span>
+            <span class="val none" id="ddGenreVal">全部</span>
+            <span class="arrow">▼</span>
+          </button>
+          <div class="dd-panel hidden" id="ddGenrePanel">
+            <input type="text" class="dd-search" id="ddGenreSearch" placeholder="搜索类别…">
+            <div class="dd-opts" id="ddGenreOpts"></div>
+            <div class="dd-foot">
+              <button data-act="all">全选</button>
+              <button data-act="none">清空</button>
+              <button data-act="close" class="primary">完成</button>
+            </div>
           </div>
         </div>
       </div>
 
-      <div class="dd" id="ddGenre">
-        <button class="dd-btn" id="ddGenreBtn">
-          <span class="lab">类别</span>
-          <span class="val none" id="ddGenreVal">全部</span>
-          <span class="arrow">▼</span>
-        </button>
-        <div class="dd-panel hidden" id="ddGenrePanel">
-          <input type="text" class="dd-search" id="ddGenreSearch" placeholder="搜索类别…">
-          <div class="dd-opts" id="ddGenreOpts"></div>
-          <div class="dd-foot">
-            <button data-act="all">全选</button>
-            <button data-act="none">清空</button>
-            <button data-act="close" class="primary">完成</button>
-          </div>
-        </div>
-      </div>
+      <div class="hint lib-stat" id="libStat">资料库为空，先到「扫描」页签点「📥 收录本目录」。</div>
 
       <div class="lib-list" id="libList"></div>
 
+      <!--
+        按钮文案刻意压短：原来四条会折成两行（多占 34px 列表高度），
+        现在能排在一行。详细说明都在 title 里。
+      -->
       <div class="btnrow">
-        <button class="btn sm primary" id="btnTranslate" title="用本地术语表把日文标题译成中文（不联网、免费）">🌐 翻译标题</button>
-        <button class="btn sm" id="btnLibClearFilter">清空筛选条件</button>
-        <button class="btn sm" id="btnLibExport">导出资料库</button>
-        <button class="btn sm" id="btnPurgeGone">🗑 清理失效条目</button>
+        <button class="btn sm primary" id="btnTranslate" title="用本地术语表把日文标题译成中文（不联网、免费）">🌐 翻译</button>
+        <button class="btn sm" id="btnLibClearFilter" title="清空关键词与演员 / 类别筛选">清空筛选</button>
+        <button class="btn sm" id="btnLibExport" title="把整个资料库导出成 JSON 备份">导出资料库</button>
+        <button class="btn sm" id="btnPurgeGone" title="把已失效（网盘里已不存在）的条目从资料库移除">🗑 清理失效</button>
       </div>
     </div>
 
@@ -932,21 +948,38 @@ export function createPanel(handlers = {}) {
      */
     const trFull = libState.facets ? (libState.facets.trFull || 0) : 0;
     const trPart = libState.facets ? (libState.facets.trPart || 0) : 0;
-    const transTip = trFull || trPart
-      ? ` · 中译 <span style="color:#2b5cff">译得动 ${trFull}</span>`
-        + ` · <span style="color:#8a6d3b">半译 ${trPart}</span>`
-      : '';
-    $('#libStat').innerHTML =
-      `资料库共 <b>${total}</b> 条` +
-      (filtered ? ` · 当前筛选命中 <b style="color:#2b5cff">${rows.length}</b> 条` : '') +
-      ` · 其中 ${tagged} 条有标签` +
-      transTip +
-      (noPc ? ` · <span style="color:#a06a00">缺提取码 ${noPc} 条</span>` : '') +
-      (gone ? ` · <span style="color:#c0322b">已失效 ${gone} 条</span>` : '');
+    /*
+     * 统计行现在被 CSS 钉成**单行**（`.lib-stat`），所以文案必须短，
+     * 否则会被省略号截掉。完整说法放 title，悬停可看。
+     * 术语也保持简短：「译好 / 半译」对应原来的「译得动 / 半译」。
+     */
+    const statShort = [
+      `共 ${total} 条`,
+      filtered ? `命中 ${rows.length}` : '',
+      `标签 ${tagged}`,
+      (trFull || trPart)
+        ? `译好 <span style="color:#2b5cff">${trFull}</span>`
+          + ` / 半译 <span style="color:#8a6d3b">${trPart}</span>`
+        : '',
+      noPc ? `<span style="color:#a06a00">缺提取码 ${noPc}</span>` : '',
+      gone ? `<span style="color:#c0322b">已失效 ${gone}</span>` : ''
+    ].filter(Boolean);
+
+    const statFull = [
+      `资料库共 ${total} 条`,
+      filtered ? `当前筛选命中 ${rows.length} 条` : '',
+      `其中 ${tagged} 条有标签`,
+      (trFull || trPart) ? `中译：译好（能读）${trFull} 条 · 半译 ${trPart} 条` : '',
+      noPc ? `缺提取码 ${noPc} 条` : '',
+      gone ? `已失效 ${gone} 条` : ''
+    ].filter(Boolean).join(' · ');
+
+    $('#libStat').innerHTML = statShort.join(' · ');
+    $('#libStat').title = statFull;
     const pg = $('#btnPurgeGone');
     if (pg) {
       pg.disabled = !gone;
-      pg.textContent = gone ? `🗑 清理失效条目 (${gone})` : '🗑 清理失效条目';
+      pg.textContent = gone ? `🗑 清理失效 (${gone})` : '🗑 清理失效';
     }
     renderLibList(rows);
   }
