@@ -14,18 +14,13 @@ const ROOT = path.dirname(__filename);
 const SRC = path.join(ROOT, 'src');
 const DIST = path.join(ROOT, 'dist');
 
-const VERSION = '1.4.2';
+const VERSION = '1.5.0';
 
-/**
- * 依赖顺序（被依赖的放前面）
- * ★ 注意：storage.js 的统计口径要用 glossary.js 的 FULL_COVERAGE 常量，
- *   所以 glossary 必须排在 storage 前面（同一作用域里 const 有暂时性死区）。
- */
+/** 依赖顺序（被依赖的放前面） */
 const MODULE_ORDER = [
   'core/frames.js',
   'core/tag-extractor.js',
   'core/providers.js',
-  'core/glossary.js',    // 标题中译术语表（v1.4.0，纯函数 + 词典数据）
   'core/storage.js',
   'core/paging.js',      // 资料库列表分批渲染（v1.3.1）
   'core/ui.js',

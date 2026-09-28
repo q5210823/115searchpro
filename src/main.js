@@ -34,19 +34,8 @@ import {
   PLAYER_PROBE_KEY,
   PLAYER_PROBE_TTL,
   playerTemplateVars,
-  fillPlayerTemplate,
-  // v1.4.0：标题中译（纯本地术语表）
-  getAllMeta,
-  applyTitleZhBatch
+  fillPlayerTemplate
 } from './core/storage.js';
-// 标题中译：纯本地术语表，不联网、零成本、无审核问题
-import {
-  translateTitle,
-  hashTitle,
-  GLOSSARY_VERSION,
-  glossarySize,
-  FULL_COVERAGE
-} from './core/glossary.js';
 // 注意：不再 import renderTagPill —— 蓝点/悬停方案已弃用，
 // 标签统一展示在面板的「资料库」页签里。
 // clearTagPills 保留，用于清除历史版本残留在页面上的旧标记。
@@ -462,19 +451,6 @@ async function queryAndCache(codes, force = false) {
       try { await putMetaBatch(metaRecords); } catch (e) { console.warn('[jv115] 落库失败', e); }
     }
 
-    /*
-     * 标题中译：跟着查询顺手做掉。
-     * 纯本地计算（术语表替换），不联网、不花钱、毫秒级，所以可以默认开着；
-     * 但它是增量的 —— 已经译过且原文没变的条目会被哈希挡掉，不会重复算。
-     */
-    if (settings?.autoTranslateTitles !== false) {
-      try {
-        await translateTitles(false, { silent: true });
-      } catch (e) {
-        console.warn('[jv115-tagger] 标题中译失败（不影响查询结果）', e);
-      }
-    }
-
     // 通知列表 frame 用刚写入的缓存重绘
     broadcast('render-cache');
 
@@ -493,141 +469,6 @@ async function queryAndCache(codes, force = false) {
     console.error('[jv115-tagger] 查询异常:', e);
     renderFailure(panel, FAIL.ERROR, { error: e.message });
   }
-}
-
-/* ==================================================================
- * 标题中译（v1.4.0）
- * ------------------------------------------------------------------
- * 纯本地：一张术语表 + 专名保护，不联网、零成本、没有内容审核问题。
- * 目标定成「看得懂」，不是「信达雅」—— 这是路线选择的前提。
- *
- * 三件事保证它长期可用：
- *   ① 翻译**按番号**缓存进 meta，同一部片只算一次
- *   ② 缓存键 = hash(原文 + 词典版本)，**改了词典就自动重译**
- *   ③ 没命中的假名如实统计出来，用户照着补词条即可
- *
- * 全部逻辑都在 core/glossary.js（纯函数、有单测），这里只负责批量与落库。
- * ================================================================== */
-
-/**
- * 把库里还没有中文标题的条目补上译文（增量）。
- * @param {boolean} force             忽略缓存全部重译（改完词条后用）
- * @param {{silent?:boolean}} [opt]   silent = 由查询流程顺手调用，不弹提示
- */
-async function translateTitles(force = false, { silent = false } = {}) {
-  const all = await getAllMeta();
-  const withTitle = all.filter((m) => m && m.code && m.title);
-  const todo = withTitle.filter((m) => force || !m.titleZh || m.titleHash !== hashTitle(m.title));
-
-  if (!todo.length) {
-    const msg = withTitle.length
-      ? `标题中译：${withTitle.length} 条已是最新（词典 v${GLOSSARY_VERSION}）`
-      : '标题中译：库里还没有元数据，先查询一次再试';
-    if (!silent) toast(msg, 'ok');
-    panel?.setHint(msg);
-    return { total: withTitle.length, done: 0, changed: 0 };
-  }
-
-  if (!silent) panel?.setBusy(true, `正在翻译 ${todo.length} 条标题…`);
-
-  const entries = [];
-  let changed = 0;
-  let missed = 0;
-  let full = 0;
-
-  for (let i = 0; i < todo.length; i++) {
-    const m = todo[i];
-    const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
-    /*
-     * 只要有一处改动就存译文 —— 这是有意的：
-     * 半译总比不译强，用户至少能认出「同窓会」是「同窗会」。
-     * 但**必须同时存覆盖率**，否则界面上分不出「译得动」和「只译到一两个词」，
-     * 一条 56% 的标题会和完整译名长得一模一样。
-     */
-    entries.push({
-      code: m.code,
-      // 没译出来就存空串，让列表老实回退到原文，而不是存一份和原文一样的「译文」
-      titleZh: r.changed ? r.zh : '',
-      titleSrc: r.changed ? 'glossary' : '',
-      titleCoverage: r.changed ? Math.round(r.coverage * 1000) / 1000 : 0,
-      // ★ 没命中也要记哈希：否则每次都会把同一批「没命中」的条目重新算一遍
-      titleHash: hashTitle(m.title),
-      titleZhAt: Date.now()
-    });
-    if (r.changed) {
-      changed++;
-      if (r.coverage >= FULL_COVERAGE) full++;
-    } else missed++;
-    if (i % 200 === 199) {
-      if (!silent) panel?.setProgress(i + 1, todo.length);
-      // 让出主线程：几千条时不能把页面卡死
-      await new Promise((res) => setTimeout(res, 0));
-    }
-  }
-
-  await applyTitleZhBatch(entries);
-  broadcast('render-cache');
-
-  /*
-   * 报数要如实：只说「N 条译出」会让人以为有 N 条可用，
-   * 实际其中不少只译到一两个词。所以把「译得动」单独拎出来说。
-   */
-  const part = changed - full;
-  const msg = `✅ 标题中译：${full} 条译得动 · ${part} 条只译到一部分 · ${missed} 条未命中`
-    + ` · 词典 v${GLOSSARY_VERSION}（${glossarySize()} 词条）`;
-  if (silent) {
-    panel?.setHint(msg);
-  } else {
-    panel?.setBusy(false, msg);
-    panel?.setHint(
-      part || missed
-        ? '术语表是「词对词替换」，长句里剩下的动词活用和助词它翻不掉，'
-          + '所以会有「一半中文一半日文」的条目 —— 这是纯本地方案的天花板，不是没生效。'
-          + '想提高覆盖率：把常用词补进 core/glossary.js，把 GLOSSARY_VERSION +1 后重新构建，已译条目会自动重译。'
-        : '全部译出，没有残留日文。'
-    );
-    toast(`标题中译完成：${full} 条译得动 · ${part} 条半译`, 'ok');
-  }
-  return { total: withTitle.length, done: todo.length, changed, full, missed };
-}
-
-/**
- * 生成「译名对照 + 待补词条清单」文本。
- *
- * 为什么把**译得最差的排在最前**：
- *   这个功能的日常维护就是「补词条」。用户需要一眼看到哪些标题还剩日文，
- *   而不是看一堆已经译好的。所以按覆盖率升序，直接把缺口怼到脸上。
- */
-async function titleSampleText() {
-  const all = (await getAllMeta()).filter((m) => m && m.title);
-  if (!all.length) return '库里还没有元数据。先到「扫描」页签查询一次，再来看对照表。';
-
-  const rows = all.map((m) => {
-    const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
-    return {
-      code: m.code, ja: m.title, zh: r.changed ? r.zh : '',
-      coverage: r.coverage, unmapped: r.unmapped, bad: r.bad
-    };
-  });
-  const ok = rows.filter((x) => x.zh).length;
-  const avg = Math.round((rows.reduce((s, x) => s + x.coverage, 0) / rows.length) * 100);
-
-  const worst = [...rows].sort((a, b) => a.coverage - b.coverage || a.code.localeCompare(b.code)).slice(0, 25);
-
-  const L = [];
-  L.push(`===== 标题中译对照（词典 v${GLOSSARY_VERSION} · ${glossarySize()} 词条）=====`);
-  L.push(`元数据 ${rows.length} 条 · 已译出 ${ok} 条 · 平均覆盖率 ${avg}%`);
-  L.push('');
-  L.push('--- 最需要补词条的 25 条（「未译」就是词典里没有的词）---');
-  worst.forEach((x, i) => {
-    L.push(`[${i + 1}] ${x.code}   覆盖率 ${Math.round(x.coverage * 100)}%${x.bad ? `（保护专名 ${x.bad} 个）` : ''}`);
-    L.push(`    原文: ${x.ja}`);
-    L.push(`    译文: ${x.zh || '(未命中，保留原文)'}`);
-    if (x.unmapped.length) L.push(`    未译: ${x.unmapped.join(' / ')}`);
-  });
-  L.push('');
-  L.push('补词方法：编辑 src/core/glossary.js 的词典表 → GLOSSARY_VERSION +1 → 重新构建，已译条目会自动重译。');
-  return L.join('\n');
 }
 
 /** 启动 */
@@ -829,13 +670,6 @@ async function bootstrap() {
           return null;
         }
       },
-      /* 标题中译（v1.4.0，纯本地术语表）：只补还没译过的 */
-      onTranslateTitles: () => translateTitles(false),
-      /* 改完词典后强制全部重译（缓存哈希里含词典版本，其实会自动失效，
-         这个按钮是给「我就想立刻全刷一遍」用的） */
-      onRetranslateTitles: () => translateTitles(true),
-      /* 「译名对照」：输出前 25 条译得最差的，方便照着补词条 */
-      onTitleSample: () => titleSampleText(),
       /* 「收录本目录」：优先走 115 官方接口拿全量，失败才回退页面扫描。
          默认是**增量**：已收录且标签完好的文件不会重新请求数据源。
          目录以后新增了视频，再点一次这个按钮就行。 */

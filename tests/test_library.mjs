@@ -15,9 +15,6 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(ROOT, '..', 'src', 'core', 'storage.js'), 'utf8');
-// storage.js 依赖 glossary.js 的 FULL_COVERAGE（统计口径），
-// 单测里要按 bundler 的顺序把两个文件拼进同一作用域
-const SRC_GLOSSARY = fs.readFileSync(path.join(ROOT, '..', 'src', 'core', 'glossary.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function check(name, actual, expected) {
@@ -29,8 +26,8 @@ function check(name, actual, expected) {
 }
 
 // ---- 加载纯函数（去掉 export / import 关键字） ----
-// ⚠️ import 也要剥：storage.js 里有 `import { FULL_COVERAGE }`，
-//    留着就是 SyntaxError（"Cannot use import statement outside a module"），
+// ⚠️ import 也要剥：源码一旦出现 `import ... from`，留在 new Function 里就是
+//    SyntaxError（"Cannot use import statement outside a module"），
 //    整个测试文件会静默崩溃 —— 这正是「判据必须是退出码」的原因。
 const strip = (s) => s
   .replace(/^\s*import\s+\{[\s\S]*?\}\s+from\s+['"][^'"]+['"];?\s*$/gm, '')
@@ -38,7 +35,7 @@ const strip = (s) => s
   .replace(/^export (async )?function /gm, '$1function ')
   .replace(/^export const /gm, 'const ');
 
-const code = strip(SRC_GLOSSARY) + '\n' + strip(SRC);
+const code = strip(SRC);
 
 const mod = new Function(
   `"use strict";

@@ -42,8 +42,8 @@ function truthy(name, actual) {
 
 /* ---------- 加载 storage.js 的纯函数 ---------- */
 const stripExports = (s) => s
-  // ⚠️ import 必须剥掉：storage.js 依赖 glossary.js 的 FULL_COVERAGE，
-  //    留着 `import ... from` 就会 SyntaxError → 整个测试文件静默崩溃
+  // ⚠️ import 必须剥掉：源码一旦出现 `import ... from`，
+  //    留在 new Function 里就是 SyntaxError → 整个测试文件静默崩溃
   .replace(/^\s*import\s+\{[\s\S]*?\}\s+from\s+['"][^'"]+['"];?\s*$/gm, '')
   .replace(/^\s*import\s+.*?from\s+['"][^'"]+['"];?\s*$/gm, '')
   // ⚠️ 必须同时处理 export function 和 export async function，
@@ -51,12 +51,8 @@ const stripExports = (s) => s
   .replace(/^export (async )?function /gm, '$1function ')
   .replace(/^export const /gm, 'const ');
 
-// 按 bundler 的顺序把 glossary.js 拼在 storage.js 前面（同一个作用域）
-const SRC_GLOSSARY = fs.readFileSync(path.join(ROOT, '..', 'src', 'core', 'glossary.js'), 'utf8');
-
 const storageMod = new Function(
   `"use strict";
-   ${stripExports(SRC_GLOSSARY)}
    ${stripExports(SRC_STORAGE)}
    return { normalizePlayMode, playerTemplateVars, fillPlayerTemplate,
             PLAY_MODES, DEFAULT_PLAYER_URL, PLAYER_PROBE_KEY, PLAYER_PROBE_TTL };

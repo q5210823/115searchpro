@@ -16,9 +16,6 @@
  * 数据完全本地，支持导出/导入 JSON 备份，清缓存前请先导出。
  */
 
-// 统计口径要用到「译得动」的覆盖率门槛（bundler 会把 glossary.js 排在前面）
-import { FULL_COVERAGE } from './glossary.js';
-
 const DB_NAME = 'jv115-tagger';
 /**
  * ⚠️ 升级版本号时，onupgradeneeded 会整体重跑。
@@ -264,21 +261,6 @@ export function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirI
     code: code || '',
     confidence: confidence ?? 0,
     title: src ? (src.title || '') : '',
-    /*
-     * 中文标题（术语表翻译）。跟 title 一样从元数据抄一份到条目上 ——
-     * 列表渲染读的是 library 记录，不抄的话译文要等下次收录才看得到。
-     * 翻译本身是按「番号」缓存在 meta 表里的，这里只是个副本。
-     */
-    titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
-    titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
-    /*
-     * 译文覆盖率（0~1）。用来区分「译得动」和「只译到一两个词」——
-     * 没有这个数就只能知道「有没有译文」，而一条 56% 覆盖率的标题
-     * 在界面上看起来和完整译名没区别，用户只会觉得「根本没翻译」。
-     */
-    titleCoverage: Number.isFinite(src?.titleCoverage)
-      ? src.titleCoverage
-      : (keepPrev ? prev.titleCoverage : undefined),
     actresses: src ? cleanArr(src.actresses) : [],
     genres: src ? cleanArr(src.genres) : [],
     cover: src ? (src.cover || '') : '',
@@ -426,18 +408,6 @@ export async function pruneLibraryDuplicates(keepRecords) {
 }
 
 /**
- * 取一条记录的译文覆盖率。
- *
- * 没这个字段的记录（v1.4.0 存下来的，当时只存了译文本身）按「译得动」算 ——
- * 不确定的时候宁可归到「能读」，也不要凭空给用户一堆「半译」。
- * 升到 GLOSSARY_VERSION 2 之后重译一次，这个字段就会补齐。
- */
-function covOf(r) {
-  const c = Number(r?.titleCoverage);
-  return Number.isFinite(c) ? c : 1;
-}
-
-/**
  * 汇总可筛选的维度：演员 / 类别 / 目录。
  * 供资料库页签生成筛选 chips（带出现次数，按次数降序）。
  */
@@ -458,81 +428,10 @@ export async function getLibraryFacets() {
   return {
     total: all.length,
     gone,
-    /*
-     * 标题中译的完成度分档。
-     * ★ v1.4.0 用的是「只要有改动就算已译」，结果一条只译对一个词的标题
-     *   也计入「已译」，面板显示「已译 3293 条」而列表看着像没生效。
-     *   现在按覆盖率分三档，让用户一眼看出真正能读的有多少。
-     */
-    trFull: all.filter((r) => r.titleZh && covOf(r) >= FULL_COVERAGE).length,
-    trPart: all.filter((r) => r.titleZh && covOf(r) < FULL_COVERAGE).length,
-    trNone: all.filter((r) => !r.titleZh).length,
     actresses: tally((r) => r.actresses || []),
     genres: tally((r) => r.genres || []),
     cids: tally((r) => (r.cid ? [r.cid] : []))
   };
-}
-
-/**
- * 把「番号 → 中文标题」写回 meta，并同步到所有引用它的资料库条目。
- *
- * 为什么必须同步两处：
- *   - `meta` 是翻译的**存放处**（按番号缓存，同一部片只译一次）
- *   - `library` 是列表**渲染时的数据源**（它存的是副本）
- *   只写 meta 的话，列表里看不到译文，得重收一次目录才生效 —— 那个体验很差。
- */
-export async function applyTitleZhBatch(entries) {
-  if (!entries || !entries.length) return { meta: 0, library: 0 };
-  const db = await openDB();
-  const byCode = new Map();
-  for (const e of entries) if (e && e.code) byCode.set(String(e.code), e);
-  if (!byCode.size) return { meta: 0, library: 0 };
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_META, STORE_LIBRARY], 'readwrite');
-    const metaStore = tx.objectStore(STORE_META);
-    const libStore = tx.objectStore(STORE_LIBRARY);
-    let metaHits = 0;
-    let libHits = 0;
-
-    // ① 元数据：按 code 取回来合并。取不到就跳过 —— 不凭空造记录
-    for (const [code, e] of byCode) {
-      const req = metaStore.get(code);
-      req.onsuccess = () => {
-        const cur = req.result;
-        if (cur) { metaStore.put(Object.assign({}, cur, e)); metaHits++; }
-      };
-    }
-
-    // ② 资料库：把译文抄到每个同番号的条目上
-    const all = libStore.getAll();
-    all.onsuccess = () => {
-      for (const r of all.result || []) {
-        const e = byCode.get(String(r.code || ''));
-        if (!e) continue;
-        /*
-         * 原文没变、译名和覆盖率也没变 → 不必写回（省 I/O）。
-         * ★ 覆盖率也要比：只比译文的话，老记录补覆盖率这一步会被跳过，
-         *   列表就永远拿不到「译得动 / 只译了一半」的区分。
-         */
-        if (
-          r.titleZh === e.titleZh &&
-          r.titleHash === e.titleHash &&
-          r.titleCoverage === e.titleCoverage
-        ) continue;
-        libStore.put(Object.assign({}, r, {
-          titleZh: e.titleZh,
-          titleSrc: e.titleSrc,
-          titleHash: e.titleHash,
-          titleCoverage: e.titleCoverage
-        }));
-        libHits++;
-      }
-    };
-
-    tx.oncomplete = () => resolve({ meta: metaHits, library: libHits });
-    tx.onerror = () => reject(tx.error);
-  });
 }
 
 /**
@@ -692,18 +591,10 @@ export const DEFAULT_SETTINGS = {
   /** 「播放」按钮的地址模板，见文件上方 DEFAULT_PLAYER_URL 的说明 */
   playerUrlTemplate: DEFAULT_PLAYER_URL,
   /**
-   * 标题中译（见 core/glossary.js）。
-   * 纯本地术语表，不联网、不花钱、没有内容审核问题。
-   * 自动模式：每次查询元数据后顺手把新标题译掉，用户不用手动点。
+   * 资料库列表里标题最多显示几行：1（默认）或 2。
+   * 一行到底时光标悬停能看全文，面板宽 380px 下比两行多放出约 1.3 条。
    */
-  autoTranslateTitles: true,
-  /**
-   * 资料库列表里标题怎么显示：
-   *   'zh'    只显示中文一行，原文放到鼠标悬停（默认）
-   *   'zh-ja' 中文一行 + 原文一行（想常驻对照时再切）
-   *   'ja'    只显示原文
-   */
-  titleDisplay: 'zh'
+  titleLines: 1
 };
 
 export async function loadSettings() {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         115 网盘 JAV 标签助手
 // @namespace    https://github.com/jv115-tagger
-// @version      1.4.2
+// @version      1.5.0
 // @description  读取 115 网盘视频文件名，自动提取番号，从 JavBus / javlibrary 拉取影片信息，在文件列表上以「标题+演员+类别」标签形式展示。纯本地标签库，不改动 115 任何原始文件，无需 API key。
 // @author       jv115-tagger
 // @match        *://*.115.com/*
@@ -881,731 +881,6 @@ function buildManualLinks(code, cfg = {}) {
 
 
 /* ==================================================================
- * core/glossary.js
- * ================================================================== */
-
-/* ==================================================================
- * 本地术语表 —— 把日文番号标题译成中文
- * ------------------------------------------------------------------
- * 设计原则（这几条决定了「能不能用」）：
- *
- * ① **纯本地、不联网、零成本。**
- *    没有 API key、没有配额、没有请求延迟，也不会有内容审核问题。
- *    代价是长句不会通顺 —— 所以目标定成「看得懂」，不是「信达雅」。
- *
- * ② **专名先占位，翻完再回填。**
- *    番号和演员名绝不能参与翻译：演员名会被逐字替换成毫无意义的汉字，
- *    番号会被拆开。做法是先把它们换成占位符，翻完再原样换回来。
- *    这是整个模块最要紧的一步，省掉它标题立刻变得不可读。
- *
- * ③ **最长优先。**
- *    「独占配信」必须整体命中，不能被拆成「独占」+「配信」。
- *    做法是把词条按长度倒序拼成一个正则，靠 alternation 的顺序取胜。
- *    （这也是为什么最短的词条要有 2 个字：单字词条会把别的词撕开。）
- *
- * ④ **残留的汉字要归一化字形。**
- *    术语表只收「整词」，剩下的汉字会原样流下来，而它们是**日文写法**：
- *    `夫婦交換`「夫婦交換」/ `家庭教師の誘惑`「家庭教師の誘惑」。
- *    所以回填专名之前要过一遍字形表（日文旧字形 → 简体）。
- *    这张表和术语表同样重要，缺了它译文里到处夹着旧字形。
- *
- * ⑤ **没译到的地方不要装。**
- *    翻完之后仍残留的假名会统计出来（`unmapped` / `coverage`），
- *    界面上如实展示 —— 用户看到哪块没译到，才好回来补词条。
- *    悄悄糊过去比留个尾巴更糟。
- *
- * ⑤ **词典是可维护的数据，不是代码。**
- *    加词只需要往下面的表里加一行。改完记得把 GLOSSARY_VERSION +1，
- *    缓存哈希会跟着变，已译条目才会自动重译。
- * ================================================================== */
-
-/**
- * 词典版本号。
- * ★ 只要改了下面的词条表，就必须把它 +1 ——
- *   翻译缓存用 `hash(原文 + 版本号)` 判断是否需要重译，
- *   不升版本的话，老条目的译文会一直停在旧规则上。
- *
- * v1 → v2：词条没动，但翻译结果里多存了「覆盖率」一项。
- *   不升版本的话已译条目不会重算，界面就永远拿不到
- *   「译得动 / 只译了一半」的区分。
- */
-const GLOSSARY_VERSION = 2;
-
-/**
- * 「译得动」的覆盖率门槛。
- *
- * ★ 为什么需要这个数：v1.4.0 只要译文与原文有**一个词**不同就标「译」，
- *   于是一条只把「同窓会」换成「同窗会」、其余全是日文的标题也挂着「译」角标。
- *   面板上于是显示「已译 3293 条」，用户看列表却觉得「大部分没生效」——
- *   两边都没说谎，是指标本身没意义。
- *   低于这个门槛的标「半」（只译到一部分），别冒充完整译名。
- */
-const FULL_COVERAGE = 0.75;
-
-/* ------------------------------------------------------------------
- * 1. 厂商 / 系列：日文写法 → 通用中文/官方写法
- * ------------------------------------------------------------------ */
-const BRANDS = [
-  ['アイデアポケット', 'IDEA POCKET'],
-  ['エスワン', 'S1'],
-  ['ムーディーズ', 'MOODYZ'],
-  ['マドンナ', 'Madonna'],
-  ['ワンズファクトリー', 'Wanz Factory'],
-  ['プレステージ', 'PRESTIGE'],
-  ['アタッカーズ', 'Attackers'],
-  ['マキシング', 'MAXING'],
-  ['エムズビデオグループ', "M's Video Group"],
-  ['ソフト・オン・デマンド', 'SOD'],
-  ['ケイ・エム・プロデュース', 'KMP']
-];
-
-/* ------------------------------------------------------------------
- * 2. 通用词：发行 / 规格 / 系列
- * ------------------------------------------------------------------ */
-const COMMON = [
-  ['デビュー', '出道'],
-  ['初撮り', '首次拍摄'],
-  ['初撮影', '首次拍摄'],
-  ['初登場', '首次登场'],
-  ['初めて', '第一次'],
-  ['新人', '新人'],
-  ['専属', '专属'],
-  ['専属女優', '专属女优'],
-  ['独占配信', '独播'],
-  ['独占', '独占'],
-  ['限定', '限定'],
-  ['永久保存版', '永久收藏版'],
-  ['保存版', '收藏版'],
-  ['完全版', '完整版'],
-  ['総集編', '总集篇'],
-  ['コレクション', '合集'],
-  ['ベスト', '精选集'],
-  ['リメイク', '重制'],
-  ['続編', '续篇'],
-  ['新作', '新作'],
-  ['発売', '发售'],
-  ['配信', '上线'],
-  ['無修正', '无修正'],
-  ['モザイク', '马赛克'],
-  ['高画質', '高画质'],
-  ['ハイビジョン', '高清'],
-  ['フルHD', '全高清'],
-  ['ノーカット', '无删减'],
-  ['未公開', '未公开'],
-  ['特典', '特典'],
-  ['映像', '影像'],
-  ['前編', '前篇'],
-  ['後編', '后篇'],
-  ['上巻', '上卷'],
-  ['下巻', '下卷'],
-  ['記念作品', '纪念作品'],
-  ['記念', '纪念'],
-  ['解禁', '解禁'],
-  ['登場', '登场'],
-  ['復活', '复出'],
-  ['引退', '引退'],
-  ['卒業', '毕业'],
-  ['移籍', '转会'],
-  ['周年', '周年']
-];
-
-/* ------------------------------------------------------------------
- * 3. 人物 / 属性
- * ------------------------------------------------------------------ */
-const PEOPLE = [
-  ['美少女', '美少女'],
-  ['単体作品', '单体作品'],
-  ['単体', '单体'],
-  ['巨乳', '巨乳'],
-  ['爆乳', '爆乳'],
-  ['美乳', '美乳'],
-  ['美女', '美女'],
-  ['美脚', '美腿'],
-  ['人妻', '人妻'],
-  ['若妻', '年轻妻子'],
-  ['熟女', '熟女'],
-  ['痴女', '痴女'],
-  ['素人', '素人'],
-  ['女優', '女优'],
-  ['未亡人', '遗孀'],
-  ['義母', '继母'],
-  ['姉妹', '姐妹'],
-  ['家庭教師', '家教'],
-  // ナース 归在片假名组，别在这里重复收录（词典重复项有测试拦着）
-  ['オフィス', '办公室'],
-  ['上司', '上司'],
-  ['部下', '下属'],
-  ['同僚', '同事'],
-  ['同級生', '同学'],
-  ['彼氏', '男友'],
-  ['彼女', '女友'],
-  ['夫婦', '夫妻'],
-  // 称呼：日文的「お姉さん」直译成「姐姐」会丢掉语感，中文习惯叫「大姐姐」
-  ['お姉さん', '大姐姐'],
-  ['お姉ちゃん', '大姐姐'],
-  ['お姉様', '大姐姐'],
-  ['おばさん', '阿姨'],
-  ['おばあちゃん', '奶奶'],
-  ['奥さん', '太太'],
-  ['奥様', '太太'],
-  ['お客様', '客人'],
-  ['女の子', '女孩'],
-  ['男の子', '男孩'],
-  ['おじさん', '大叔'],
-  ['おじいちゃん', '爷爷']
-];
-
-/* ------------------------------------------------------------------
- * 4. 场景 / 情节（术语化的简短对应，不做发挥）
- * ------------------------------------------------------------------ */
-const SCENES = [
-  ['中出し', '内射'],
-  ['顔射', '颜射'],
-  ['ごっくん', '吞精'],
-  ['潮吹き', '潮吹'],
-  ['調教', '调教'],
-  ['催眠', '催眠'],
-  ['洗脳', '洗脑'],
-  ['痴漢', '痴汉'],
-  ['電車', '电车'],
-  ['尾行', '跟踪'],
-  ['盗撮', '偷拍'],
-  ['露出', '露出'],
-  ['野外', '野外'],
-  ['密室', '密室'],
-  ['縛り', '绳缚'],
-  ['奴隷', '奴隶'],
-  ['玩具', '玩具'],
-  ['巨根', '巨根'],
-  ['童貞', '处男'],
-  ['筆おろし', '破处'],
-  ['筆下ろし', '破处'],
-  ['ナンパ', '搭讪'],
-  ['逆ナン', '女方搭讪'],
-  ['合コン', '联谊'],
-  ['不倫', '出轨'],
-  ['浮気', '外遇'],
-  ['寝取られ', '被夺爱'],
-  ['本番', '实战'],
-  ['温泉', '温泉'],
-  ['旅行', '旅行'],
-  ['密着', '贴身跟拍'],
-  ['ドキュメント', '纪录片'],
-  ['リアル', '真实']
-];
-
-/* ------------------------------------------------------------------
- * 5. 形容词 / 宣传语
- * ------------------------------------------------------------------ */
-const PRAISE = [
-  ['大人気', '超人气'],
-  ['人気', '人气'],
-  ['極上', '极品'],
-  ['究極', '究极'],
-  ['最高', '最高'],
-  ['話題', '话题'],
-  ['衝撃', '冲击'],
-  ['完全', '完全']
-];
-
-/* ------------------------------------------------------------------
- * 7. 常见片假名外来语
- * 片假名是纯表音文字，必须整词收录 —— 逐字转换是不可能的。
- * 这里只收标题里高频的那些；漏掉的会在预览里以「未译」列出来。
- * ------------------------------------------------------------------ */
-const KATAKANA = [
-  ['アイドル', '偶像'],
-  ['コスプレ', '角色扮演'],
-  ['ランジェリー', '内衣'],
-  ['マッサージ', '按摩'],
-  ['エステ', '美容'],
-  ['ヨガ', '瑜伽'],
-  ['メイド', '女仆'],
-  ['ウェディング', '婚纱'],
-  ['ドレス', '礼服'],
-  ['ナース', '护士'],
-  ['スレンダー', '苗条'],
-  ['スタイル', '身材'],
-  ['キス', '亲吻'],
-  ['ベロ', '舌'],
-  ['スマホ', '手机'],
-  ['カメラ', '相机'],
-  ['ホテル', '酒店'],
-  ['ラブホテル', '情侣酒店'],
-  ['ビジネス', '商务'],
-  ['オナニー', '自慰'],
-  ['フェラ', '口交'],
-  ['パイズリ', '乳交'],
-  ['ローション', '润滑液'],
-  ['バイブ', '震动棒'],
-  ['ローター', '跳蛋'],
-  ['おもちゃ', '玩具'],
-  ['ドキュメンタリー', '纪录'],
-  ['インタビュー', '访谈'],
-  ['コンプリート', '完整收录'],
-  ['リクエスト', '点播'],
-  ['アンケート', '问卷'],
-  ['ファン', '粉丝'],
-  ['デート', '约会'],
-  ['ラブラブ', '甜蜜'],
-  ['ドキドキ', '心跳'],
-  ['ハメ撮り', '手持自拍'],
-  ['オフ会', '线下聚会'],
-  ['パパ活', '包养约会'],
-  ['ママ活', '被包养'],
-  ['ノーブラ', '不穿内衣'],
-  ['パンスト', '丝袜'],
-  ['ニーハイ', '过膝袜'],
-  ['スクール', '校园'],
-  ['セーラー服', '水手服'],
-  ['ブルマ', '运动短裤'],
-  ['水着', '泳装'],
-  ['ランキング', '排行榜'],
-  ['サンプル', '样品']
-];
-
-/* ------------------------------------------------------------------
- * 6. 量词 / 时间
- * ★ 「時間 → 小时」必须在「分 → 分钟」之前，否则「4時間」会被拆成「4时」+「间」
- * ------------------------------------------------------------------ */
-const UNITS = [
-  ['時間', '小时'],
-  ['枚組', '张套装'],
-  ['分間', '分钟']
-];
-
-/**
- * 助词。
- * ⚠️ 单字词条很危险 —— 它们会把别的词撕开（`はじめ` 被「は」咬掉就废了）。
- *    所以这里只收助词，而且除了 `の` 之外都要求「左边紧邻中日文字符」才替换，
- *    避免误伤词首。
- *    值给空串 = 直接丢掉（中文里没有对应虚词，留着反而是乱码）。
- */
-const PARTICLES = [
-  ['の', '的'],
-  ['と', '与'],
-  ['や', '与'],
-  ['を', ''],
-  ['が', ''],
-  ['は', ''],
-  ['に', ''],
-  ['へ', '向'],
-  ['で', ''],
-  ['も', '也'],
-  // 敬称/接尾：中文里没有对应成分，留着只是乱码，直接丢掉
-  ['さん', ''],
-  ['ちゃん', ''],
-  ['様', ''],
-  ['君', '']
-];
-
-/* ------------------------------------------------------------------
- * 8. 假名词（平假名/片假名混写的小词）
- *
- * ⚠️ 这一组必须**整词收录**。反例：`昼下がり` 里的 `が` 会被助词规则当虚词删掉
- *    →「昼下り」。助词规则无论如何都会误伤一部分词，补救办法只有把词收进来
- *    （术语替换在长度上优先于助词）。
- * ------------------------------------------------------------------ */
-const KANA_WORDS = [
-  ['昼下がり', '午后'],
-  ['夕暮れ', '黄昏'],
-  ['真夜中', '深夜'],
-  ['はじめて', '第一次'],
-  ['かわいい', '可爱'],
-  ['きれい', '漂亮'],
-  ['すごい', '厉害'],
-  ['いっぱい', '满满'],
-  ['たくさん', '很多'],
-  ['ください', '请'],
-  ['お願い', '拜托'],
-  ['いやらしい', '淫荡'],
-  ['感じる', '感受'],
-  ['イク', '高潮'],
-  ['おっぱい', '胸部'],
-  ['お尻', '臀部'],
-  ['あそこ', '私处'],
-  ['エッチ', '色色']
-];
-
-/**
- * 日文旧字形 / 繁体 → 简体字形表。
- *
- * ★ 为什么必须有这张表：
- *   术语表只能收录「整词」。标题里剩下的汉字会原样留在译文里，
- *   而它们用的是**日文写法**：
- *       専属決定 → 读者看到的是「専属決定」，而中文应当写「专属决定」
- *       夫婦交換 → 「夫妇交换」   家庭教師の誘惑 → 「家教的诱惑」
- *   不做这一步，译文里就会到处夹着旧字形，一眼就看出是半成品。
- *
- * ⚠️ 只收「日文这么写、中文不这么写」的字。中日写法相同的字一个都不能放进来，
- *   否则会把本来正确的字改错。测试里对这张表做了格式校验。
- *
- * 格式：`日文写法:简体写法`，用空白分隔，`#` 开头是注释。
- */
-const KANJI_J2S = `
-  # ── 日文新字体（战后自行简化）──
-  # 这一批才是标题里真正会出现的：日文把舊字體简化成了自己的写法，
-  # 和中文的简化方案不一定相同（例：日文「図」中文「图」）。
-  発:发 髪:发 髮:发 専:专 決:决 極:极 読:读 撃:击 対:对 関:关 楽:乐 様:样
-  説:说 実:实 戦:战 顔:颜 辺:边 顕:显 観:观 売:卖 転:转 軽:轻 銭:钱
-  録:录 鉄:铁 駅:站 産:产 権:权 従:从 円:圆 囲:围 団:团 壊:坏 聴:听
-  脳:脑 臓:脏 挙:举 処:处 覚:觉 証:证 賛:赞 釈:释 隠:隐 歴:历 広:广
-  応:应 慶:庆 懐:怀 栄:荣 検:检 浄:净 満:满 済:济 獣:兽 穏:稳 競:竞
-  節:节 縁:缘 継:继 絶:绝 聡:聪 粛:肃 譲:让 価:价 児:儿 暁:晓 図:图
-  厳:严 剣:剑 繊:纤 総:总 徳:德 恵:惠 稲:稻 亜:亚 営:营 衛:卫 塩:盐
-  桜:樱 犠:牺 戯:戏 拠:据 挟:夹 蛍:萤 渓:溪 鶏:鸡 芸:艺 県:县 圏:圈
-  鉱:矿 効:效 黒:黑 砕:碎 剤:剂 糸:丝 舎:舍 収:收 渋:涩 縦:纵 諸:诸
-  奨:奖 剰:剩 畳:叠 縄:绳 壌:壤 嬢:娘 錠:锭 粋:粹 酔:醉 穂:穗 髄:髓
-  枢:枢 瀬:濑 畝:亩 製:制 併:并 倹:俭 剝:剥 罵:骂 賄:贿 稜:棱 箇:个
-  籠:笼 繕:缮 脈:脉 腳:脚 脫:脱 艦:舰 粧:妆 繭:茧 與:与 參:参 圖:图
-  嚴:严 擴:扩 攝:摄 戶:户 執:执 兒:儿 齒:齿 龍:龙 齊:齐 價:价 傳:传
-  # ── 舊字體（日文与繁体同形，中文已简化）──
-  屬:属 換:换 誘:诱 婦:妇 畫:画 號:号 場:场 現:现 學:学 體:体 際:际
-  護:护 險:险 驗:验 點:点 過:过 進:进 遠:远 適:适 選:选 達:达 連:连
-  開:开 間:间 問:问 隊:队 難:难 電:电 願:愿 類:类 語:语 課:课 記:记
-  認:认 識:识 談:谈 論:论 買:买 賣:卖 質:质 費:费 資:资 車:车 較:较
-  輪:轮 載:载 鐘:钟 鋼:钢 錯:错 鏡:镜 長:长 門:门 頁:页 頂:顶 順:顺
-  須:须 題:题 額:额 風:风 飛:飞 飯:饭 館:馆 馬:马 惡:恶 壓:压 變:变
-  練:练 毎:每 氣:气 焼:烧 經:经 絵:绘 給:给 結:结 續:续 網:网 線:线
-  習:习 職:职 誰:谁 調:调 講:讲 謝:谢 議:议 豊:丰 貯:贮 貸:贷 購:购
-  遅:迟 遊:游 運:运 郵:邮 郷:乡 醸:酿 鈴:铃 鍋:锅 閉:闭 陸:陆 陽:阳
-  陰:阴 陣:阵 雑:杂 雲:云 飲:饮 飼:饲 見:见 貝:贝 員:员 園:园 膚:肤
-  華:华 葉:叶 術:术 衝:冲 補:补 親:亲 討:讨 訓:训 訊:讯 訪:访 訴:诉
-  診:诊 詐:诈 評:评 詞:词 試:试 詩:诗 詳:详 誠:诚 誕:诞 誌:志 實:实
-  貫:贯 責:责 貴:贵 貿:贸 貼:贴 賀:贺 賓:宾 賭:赌 贈:赠 跡:迹 軌:轨
-  軟:软 輝:辉 輸:输 農:农 針:针 釣:钓 鈍:钝 銀:银 銅:铜 鎖:锁 閃:闪
-  閣:阁 閲:阅 階:阶 韓:韩 項:项 預:预 領:领 頭:头 頸:颈 頻:频 顆:颗
-  顧:顾 飾:饰 飽:饱 養:养 駐:驻 騎:骑 驚:惊 魚:鱼 鳥:鸟 鳴:鸣 麗:丽
-  為:为 爭:争 卻:却 應:应 懸:悬 樹:树 橫:横 標:标 橋:桥 機:机 殺:杀
-  沒:没 溫:温 濕:湿 災:灾 獨:独 獻:献 猶:犹 獄:狱 環:环 畢:毕 疊:叠
-  盡:尽 監:监 盤:盘 矯:矫 礦:矿 禪:禅 積:积 窮:穷 竊:窃 筆:笔 範:范
-  築:筑 簡:简 籃:篮 緊:紧 緒:绪 織:织 繪:绘 羅:罗 聖:圣 聞:闻 聯:联
-  脅:胁 艱:艰 壽:寿 夢:梦 覺:觉 計:计 訂:订 話:话 該:该 誤:误 請:请
-  財:财 愛:爱 損:损 數:数 斷:断 時:时 書:书 復:复 戲:戏 優:优 備:备
-  勝:胜 務:务 動:动 勢:势 億:亿 個:个 們:们 兩:两 單:单 區:区 協:协
-  堅:坚 奪:夺 奧:奥 敵:敌 於:于 細:细 統:统 總:总 聯:联 腦:脑 歐:欧
-`;
-
-/** 全部词条（顺序不影响结果，构造时会按长度重排） */
-const GLOSSARY = [].concat(
-  BRANDS, COMMON, PEOPLE, KATAKANA, KANA_WORDS, SCENES, PRAISE, UNITS
-);
-
-/** 助词表单独导出，方便测试「单字只允许出现在这里」 */
-const GLOSSARY_PARTICLES = PARTICLES;
-
-/* ------------------------------------------------------------------
- * 字形归一化：日文旧字形 → 简体
- * ------------------------------------------------------------------ */
-
-/**
- * 解析字形表。
- * 忽略：注释、格式不对的条目、以及左右相同的条目（同形字本来就不需要映射）。
- * 这样即使表里手滑写了一两条错的，也只是被跳过，不会改错字。
- */
-function buildKanjiMap() {
-  const m = new Map();
-  for (const tok of KANJI_J2S.split(/\s+/)) {
-    if (!tok || tok[0] === '#') continue;
-    if (tok.length !== 3 || tok[1] !== ':') continue;   // 只接受「一个字:一个字」
-    const from = tok[0];
-    const to = tok[2];
-    if (from === to) continue;
-    if (m.has(from) && m.get(from) !== to) {
-      // 同一个字被映射成两个结果 → 表写错了，保留先出现的那个并报警
-      console.warn(`[jv115-tagger] 字形表冲突：${from} → ${m.get(from)} / ${to}，已忽略后者`);
-      continue;
-    }
-    m.set(from, to);
-  }
-  return m;
-}
-
-let _kanjiMap = null;
-
-/**
- * 逐字把残留的日文旧字形换成简体。
- * ★ 必须在**专名回填之前**调用 —— 否则会把演员名里的字也改掉。
- */
-function normalizeKanji(s) {
-  if (!_kanjiMap) _kanjiMap = buildKanjiMap();
-  let out = '';
-  for (const ch of String(s == null ? '' : s)) out += _kanjiMap.get(ch) || ch;
-  return out;
-}
-
-/** 供测试与文档用：字形表的有效条目数 */
-function kanjiTableSize() {
-  return buildKanjiMap().size;
-}
-
-/* ------------------------------------------------------------------
- * 词典构建（惰性，只做一次）
- * ------------------------------------------------------------------ */
-
-/** 全角转半角等统一处理：`ＡＶ`→`AV`、`４時間`→`4時間` */
-function norm(s) {
-  const t = String(s ?? '');
-  try { return t.normalize('NFKC'); } catch (e) { return t; }
-}
-
-function escapeRe(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-let _glossaryRe = null;
-let _glossaryMap = null;
-
-function buildGlossary() {
-  if (_glossaryRe) return { re: _glossaryRe, map: _glossaryMap };
-  // 去重：同一条词条只保留第一次出现的译法
-  const map = new Map();
-  for (const [ja, zh] of GLOSSARY) {
-    const k = norm(ja).trim();
-    if (!k || map.has(k)) continue;
-    map.set(k, zh);
-  }
-  // ★ 最长优先：按长度倒序拼 alternation，长的排在前面才会先命中
-  const keys = [...map.keys()].sort((a, b) => b.length - a.length);
-  _glossaryMap = map;
-  _glossaryRe = keys.length
-    ? new RegExp(keys.map(escapeRe).join('|'), 'g')
-    : /(?!)/g;
-  return { re: _glossaryRe, map: _glossaryMap };
-}
-
-/** 供测试与文档用：返回「去重后」的词条数量 */
-function glossarySize() {
-  return buildGlossary().map.size;
-}
-
-/* ------------------------------------------------------------------
- * 专名保护
- * ------------------------------------------------------------------ */
-
-/** 会把标题撕开、且绝不该翻译的东西，全部换成占位符 */
-function protectSpecials(text, ctx = {}) {
-  const slots = [];
-  const patterns = [];
-
-  const pushLiteral = (v) => {
-    const s = norm(v).trim();
-    if (s.length < 2) return;
-    // 名字里的空格可能被网页改写成不同宽度 → 用 \s* 串起来匹配
-    const loose = s.split('').map(escapeRe).join('\\s*');
-    patterns.push(loose);
-  };
-
-  // ① 番号：优先用收录时已经提取好的 code（最准）
-  if (ctx.code) pushLiteral(String(ctx.code).toUpperCase());
-  // ② 兜底：形如 ABCD-123 的番号（NFKC 之后连字符只剩半角一种）
-  patterns.push('[A-Z]{2,8}-\\d{2,6}');
-  // ③ 演员名：一个都不许翻
-  for (const a of Array.isArray(ctx.actresses) ? ctx.actresses : []) pushLiteral(a);
-
-  if (!patterns.length) return { text, slots };
-
-  const re = new RegExp(patterns.join('|'), 'gi');
-  const out = text.replace(re, (m) => {
-    const i = slots.length;
-    slots.push(m);
-    return `\u0001${i}\u0002`;
-  });
-  return { text: out, slots };
-}
-
-function restoreSpecials(text, slots) {
-  if (!slots.length) return text;
-  return text.replace(/\u0001(\d+)\u0002/g, (m, i) => {
-    const v = slots[Number(i)];
-    return v == null ? m : v;
-  });
-}
-
-/* ------------------------------------------------------------------
- * 清洗
- * ------------------------------------------------------------------ */
-
-function polish(s) {
-  let t = String(s);
-
-  // 标点统一
-  t = t.replace(/[～〜]/g, '~');
-  t = t.replace(/[・･]{2,}/g, '·');
-  t = t.replace(/[、]{2,}/g, '、');
-  t = t.replace(/[ ]{2,}/g, ' ');
-  // 标点两侧不要空格
-  t = t.replace(/\s*([、，。！？：；·])\s*/g, '$1');
-  // 空括号直接清掉
-  t = t.replace(/[（(]\s*[）)]/g, '');
-  t = t.replace(/([（(])\s+/g, '$1').replace(/\s+([）)])/g, '$1');
-  // 重复词合并：中出し中出し → 内射内射 → 内射
-  t = t.replace(/([\u4e00-\u9fa5]{2,6})\1/g, '$1');
-  t = t.replace(/的{2,}/g, '的');
-  // 中英之间补一个空格，读起来才不像连在一起
-  t = t.replace(/([\u4e00-\u9fa5])([A-Za-z0-9])/g, '$1 $2');
-  t = t.replace(/([A-Za-z0-9])([\u4e00-\u9fa5])/g, '$1 $2');
-  // 首尾多余的分隔符
-  t = t.replace(/^[\s·、,，\-–—~]+/, '').replace(/[\s·、,，\-–—~]+$/, '');
-  t = t.replace(/\s{2,}/g, ' ').trim();
-  return t;
-}
-
-/** 助词替换：除 `の` 外都要求左边紧邻中日文字符，避免咬到词首 */
-function applyParticles(s) {
-  let t = String(s);
-  for (const [ja, zh] of PARTICLES) {
-    if (ja === 'の') {
-      t = t.replace(/の/g, zh);
-    } else {
-      const re = new RegExp(`([\\u4e00-\\u9fa5\\u3040-\\u30ff])${escapeRe(ja)}`, 'g');
-      t = t.replace(re, (m, p1) => p1 + zh);
-    }
-  }
-  return t;
-}
-
-/* ------------------------------------------------------------------
- * 主函数
- * ------------------------------------------------------------------ */
-
-/**
- * 把一个日文标题译成中文。
- *
- * @param {string} jaTitle 原始标题
- * @param {object} [ctx]    { code, actresses }
- * @returns {{zh:string, ja:string, changed:boolean, coverage:number,
- *            unmapped:string[], bad:number, translated:number}}
- *   - `zh`        译文；**没译到任何东西时返回空串**（交给调用方决定回退原文）
- *   - `changed`   是否真的改动过
- *   - `coverage`  0~1，粗略表示「有多少内容被译到」
- *   - `unmapped`  残留的假名片段（界面上如实提示，方便回来补词条）
- *   - `translated` 命中的词条数，`bad` 保护掉的专名数
- */
-function translateTitle(jaTitle, ctx = {}) {
-  const raw = String(jaTitle ?? '').trim();
-  const empty = {
-    zh: '', ja: raw, changed: false, coverage: 0, unmapped: [], bad: 0, translated: 0
-  };
-  if (!raw) return empty;
-
-  // ① 专名占位
-  const guarded = protectSpecials(norm(raw), ctx);
-
-  // ② 词条替换（最长优先），顺便数一下命中次数
-  const { re, map } = buildGlossary();
-  let hits = 0;
-  let out = guarded.text.replace(re, (m) => {
-    hits++;
-    return map.get(m);
-  });
-
-  // ③ 助词
-  out = applyParticles(out);
-
-  /*
-   * ④ 字形归一化。
-   * 术语表只能收「整词」，剩下的汉字会原样流下来 —— 而那些是**日文写法**
-   * （夫婦交換 / 家庭教師の誘惑 / 専属決定）。不做这一步，译文里就到处是旧字形，
-   * 一眼看出是半成品。这一步和专名保护一样，必须排在回填之前。
-   */
-  out = normalizeKanji(out);
-
-  // ⑤ 清洗（此时专名还是占位符，不会被清洗规则碰到）
-  out = polish(out);
-
-  /*
-   * ⑥ 统计残留假名。
-   * ★ 必须放在**回填之前** —— 演员名本身是日文，
-   *   回填后再数假名会把「被保护起来的专名」也算成「没译到」，
-   *   于是每条带演员名的标题 coverage 都会虚低，这个指标就废了。
-   */
-  const kana = out.match(/[\u3040-\u309f\u30a0-\u30ff]+/g) || [];
-  const unmapped = [...new Set(kana.map((x) => x.trim()).filter(Boolean))];
-  const body = out.replace(/[\s\u0001\u0002\d]/g, '');
-  const kanaLen = kana.join('').length;
-  const coverage = body.length ? Math.max(0, Math.min(1, 1 - kanaLen / body.length)) : 0;
-
-  // ⑦ 专名回填（番号 / 演员名原样换回来）
-  out = restoreSpecials(out, guarded.slots);
-
-  const changed = out !== raw;
-  if (!changed) return { ...empty, bad: guarded.slots.length };
-
-  return {
-    zh: out,
-    ja: raw,
-    changed: true,
-    coverage: Number(coverage.toFixed(3)),
-    unmapped,
-    bad: guarded.slots.length,
-    translated: hits
-  };
-}
-
-/**
- * 缓存用哈希。
- * ★ 把 GLOSSARY_VERSION 混进去是**必须的**：
- *   这样一改词典，所有已译条目的哈希都对不上，会被自动重译。
- *   否则用户加了词条却发现老标题纹丝不动，只会以为功能坏了。
- */
-function hashTitle(jaTitle) {
-  const s = `${norm(jaTitle)}#v${GLOSSARY_VERSION}`;
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
-  return h.toString(36);
-}
-
-/* ------------------------------------------------------------------
- * 展示：中文一行 + 原文放悬停
- * ------------------------------------------------------------------ */
-
-/**
- * 算出列表里该显示什么。
- *
- * ★ 默认只显示**一行中文**，原文放进 `hover`（鼠标悬停才看）。
- *   早先默认是「中文主行 + 原文副行」两行，实测列表太挤、每条都占两行，
- *   反而不好扫 —— 原文不是不用，是不该常驻占位。
- *
- * @param {object} rec  资料库记录（用到 title / titleZh / titleCoverage / titleSrc / fileName）
- * @param {string} mode 'zh' 只中文（默认，原文放悬停）
- *                      'zh-ja' 中文一行 + 原文一行（想看原文时再切）
- *                      'ja' 只原文
- * @returns {{main:string, sub:string, hover:string, badge:string, translated:boolean}}
- *          badge: '' 无译文 / 'full' 译得动 / 'part' 只译到一部分
- */
-function titleDisplayParts(rec, mode = 'zh') {
-  const ja = String(rec?.title || '').trim();
-  const zh = String(rec?.titleZh || '').trim();
-  const fallback = String(rec?.fileName || '');
-  const hasZh = !!zh && zh !== ja;
-
-  if (mode === 'ja') {
-    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
-  }
-  // 没有译文就老实显示原文，**不要留空白**
-  if (!hasZh) {
-    return { main: ja || fallback, sub: '', hover: '', badge: '', translated: false };
-  }
-
-  const hover = ja && ja !== zh ? ja : '';
-  /*
-   * 覆盖率缺失时（老记录、或从备份导入的）按「译得动」算 ——
-   * 宁可多标一个「译」，也不要给用户一堆没来由的「半」。
-   */
-  const cov = Number(rec?.titleCoverage);
-  const full = Number.isFinite(cov) ? cov >= FULL_COVERAGE : true;
-  // 只有术语表产出的译文才挂角标；将来若支持手工译名，手工的不该标成「机器译」
-  const badge = rec?.titleSrc === 'glossary' ? (full ? 'full' : 'part') : '';
-
-  if (mode === 'zh-ja') {
-    return { main: zh, sub: ja, hover, badge, translated: true };
-  }
-  return { main: zh, sub: '', hover, badge, translated: true };
-}
-
-
-/* ==================================================================
  * core/storage.js
  * ================================================================== */
 
@@ -1626,8 +901,6 @@ function titleDisplayParts(rec, mode = 'zh') {
  *
  * 数据完全本地，支持导出/导入 JSON 备份，清缓存前请先导出。
  */
-
-// 统计口径要用到「译得动」的覆盖率门槛（bundler 会把 glossary.js 排在前面）
 
 const DB_NAME = 'jv115-tagger';
 /**
@@ -1864,21 +1137,6 @@ function buildLibraryRecord({ cid, fileName, fileId, pickcode, size, dirIndex, c
     code: code || '',
     confidence: confidence ?? 0,
     title: src ? (src.title || '') : '',
-    /*
-     * 中文标题（术语表翻译）。跟 title 一样从元数据抄一份到条目上 ——
-     * 列表渲染读的是 library 记录，不抄的话译文要等下次收录才看得到。
-     * 翻译本身是按「番号」缓存在 meta 表里的，这里只是个副本。
-     */
-    titleZh: src ? (src.titleZh || (keepPrev ? prev.titleZh || '' : '')) : (keepPrev ? prev.titleZh || '' : ''),
-    titleSrc: src ? (src.titleSrc || (keepPrev ? prev.titleSrc || '' : '')) : (keepPrev ? prev.titleSrc || '' : ''),
-    /*
-     * 译文覆盖率（0~1）。用来区分「译得动」和「只译到一两个词」——
-     * 没有这个数就只能知道「有没有译文」，而一条 56% 覆盖率的标题
-     * 在界面上看起来和完整译名没区别，用户只会觉得「根本没翻译」。
-     */
-    titleCoverage: Number.isFinite(src?.titleCoverage)
-      ? src.titleCoverage
-      : (keepPrev ? prev.titleCoverage : undefined),
     actresses: src ? cleanArr(src.actresses) : [],
     genres: src ? cleanArr(src.genres) : [],
     cover: src ? (src.cover || '') : '',
@@ -2018,18 +1276,6 @@ async function pruneLibraryDuplicates(keepRecords) {
 }
 
 /**
- * 取一条记录的译文覆盖率。
- *
- * 没这个字段的记录（v1.4.0 存下来的，当时只存了译文本身）按「译得动」算 ——
- * 不确定的时候宁可归到「能读」，也不要凭空给用户一堆「半译」。
- * 升到 GLOSSARY_VERSION 2 之后重译一次，这个字段就会补齐。
- */
-function covOf(r) {
-  const c = Number(r?.titleCoverage);
-  return Number.isFinite(c) ? c : 1;
-}
-
-/**
  * 汇总可筛选的维度：演员 / 类别 / 目录。
  * 供资料库页签生成筛选 chips（带出现次数，按次数降序）。
  */
@@ -2050,81 +1296,10 @@ async function getLibraryFacets() {
   return {
     total: all.length,
     gone,
-    /*
-     * 标题中译的完成度分档。
-     * ★ v1.4.0 用的是「只要有改动就算已译」，结果一条只译对一个词的标题
-     *   也计入「已译」，面板显示「已译 3293 条」而列表看着像没生效。
-     *   现在按覆盖率分三档，让用户一眼看出真正能读的有多少。
-     */
-    trFull: all.filter((r) => r.titleZh && covOf(r) >= FULL_COVERAGE).length,
-    trPart: all.filter((r) => r.titleZh && covOf(r) < FULL_COVERAGE).length,
-    trNone: all.filter((r) => !r.titleZh).length,
     actresses: tally((r) => r.actresses || []),
     genres: tally((r) => r.genres || []),
     cids: tally((r) => (r.cid ? [r.cid] : []))
   };
-}
-
-/**
- * 把「番号 → 中文标题」写回 meta，并同步到所有引用它的资料库条目。
- *
- * 为什么必须同步两处：
- *   - `meta` 是翻译的**存放处**（按番号缓存，同一部片只译一次）
- *   - `library` 是列表**渲染时的数据源**（它存的是副本）
- *   只写 meta 的话，列表里看不到译文，得重收一次目录才生效 —— 那个体验很差。
- */
-async function applyTitleZhBatch(entries) {
-  if (!entries || !entries.length) return { meta: 0, library: 0 };
-  const db = await openDB();
-  const byCode = new Map();
-  for (const e of entries) if (e && e.code) byCode.set(String(e.code), e);
-  if (!byCode.size) return { meta: 0, library: 0 };
-
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_META, STORE_LIBRARY], 'readwrite');
-    const metaStore = tx.objectStore(STORE_META);
-    const libStore = tx.objectStore(STORE_LIBRARY);
-    let metaHits = 0;
-    let libHits = 0;
-
-    // ① 元数据：按 code 取回来合并。取不到就跳过 —— 不凭空造记录
-    for (const [code, e] of byCode) {
-      const req = metaStore.get(code);
-      req.onsuccess = () => {
-        const cur = req.result;
-        if (cur) { metaStore.put(Object.assign({}, cur, e)); metaHits++; }
-      };
-    }
-
-    // ② 资料库：把译文抄到每个同番号的条目上
-    const all = libStore.getAll();
-    all.onsuccess = () => {
-      for (const r of all.result || []) {
-        const e = byCode.get(String(r.code || ''));
-        if (!e) continue;
-        /*
-         * 原文没变、译名和覆盖率也没变 → 不必写回（省 I/O）。
-         * ★ 覆盖率也要比：只比译文的话，老记录补覆盖率这一步会被跳过，
-         *   列表就永远拿不到「译得动 / 只译了一半」的区分。
-         */
-        if (
-          r.titleZh === e.titleZh &&
-          r.titleHash === e.titleHash &&
-          r.titleCoverage === e.titleCoverage
-        ) continue;
-        libStore.put(Object.assign({}, r, {
-          titleZh: e.titleZh,
-          titleSrc: e.titleSrc,
-          titleHash: e.titleHash,
-          titleCoverage: e.titleCoverage
-        }));
-        libHits++;
-      }
-    };
-
-    tx.oncomplete = () => resolve({ meta: metaHits, library: libHits });
-    tx.onerror = () => reject(tx.error);
-  });
 }
 
 /**
@@ -2280,18 +1455,10 @@ const DEFAULT_SETTINGS = {
   /** 「播放」按钮的地址模板，见文件上方 DEFAULT_PLAYER_URL 的说明 */
   playerUrlTemplate: DEFAULT_PLAYER_URL,
   /**
-   * 标题中译（见 core/glossary.js）。
-   * 纯本地术语表，不联网、不花钱、没有内容审核问题。
-   * 自动模式：每次查询元数据后顺手把新标题译掉，用户不用手动点。
+   * 资料库列表里标题最多显示几行：1（默认）或 2。
+   * 一行到底时光标悬停能看全文，面板宽 380px 下比两行多放出约 1.3 条。
    */
-  autoTranslateTitles: true,
-  /**
-   * 资料库列表里标题怎么显示：
-   *   'zh'    只显示中文一行，原文放到鼠标悬停（默认）
-   *   'zh-ja' 中文一行 + 原文一行（想常驻对照时再切）
-   *   'ja'    只显示原文
-   */
-  titleDisplay: 'zh'
+  titleLines: 1
 };
 async function loadSettings() {
   const saved = await getAllSettings();
@@ -2692,7 +1859,7 @@ input:focus, select:focus { border-color: #2b5cff; }
 
 /*
  * 统计行：钉死单行。
- * 原来「资料库共 3869 条 · 当前筛选命中 59 条 · 其中 59 条有标签 · 中译译得动 560 …」
+ * 原来「资料库共 3869 条 · 当前筛选命中 59 条 · 其中 59 条有标签 · 缺提取码 …」
  * 在 352px 内必然折成两行，白占 18px。文案缩短 + nowrap + 省略号，
  * 无论后面再拼多少段都只占一行；完整含义放进 title。
  */
@@ -2773,24 +1940,19 @@ input:focus, select:focus { border-color: #2b5cff; }
 }
 .lib-item .badge.warn { background: #fff6e0; color: #a06a00; border: 1px solid #f2dfb0; }
 .lib-item .badge.bad  { background: #fdeceb; color: #c0322b; border: 1px solid #f5cdc9; }
-/* 标题主行：v1.4.0 起这里是**中文**（没译出时退回原文） */
+/* 标题：行数由 .lib-list 上的 lines-1 / lines-2 决定（见下方规则） */
 .lib-item .ttl {
   font-size: 12.5px; color: #1f2329; margin-top: 2px; line-height: 1.45;
   overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 /*
- * 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗。
- * v1.4.1 起默认不再显示这一行（原文改到鼠标悬停），只有把显示方式切成
- * 「中文一行 + 原文一行」时才用得上。
+ * 标题行数切换。面板宽固定 380px，标题少占一行列表就多露出一条
+ * （单行约多 1.3 条），所以默认 1 行，超出部分靠 title 属性悬停看全文。
+ * 挂在容器上而不是逐条改样式 —— 换一次 class 比遍历 50 个节点便宜。
  */
-.lib-item .ttl-ja {
-  font-size: 11px; color: #9aa3b2; margin-top: 1px; line-height: 1.4;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-/* 「译」= 这份译文基本能读；「半」= 只译到一部分，剩下的还是日文 */
-.lib-item .badge.tr { background: #eef2ff; color: #2b5cff; border: 1px solid #ccd8ff; }
-.lib-item .badge.tr.half { background: #fdf6e8; color: #8a6d3b; border-color: #f0e0c0; }
+.lib-list.lines-1 .lib-item .ttl { -webkit-line-clamp: 1; }
+.lib-list.lines-2 .lib-item .ttl { -webkit-line-clamp: 2; }
 .lib-item .tags {
   font-size: 11px; color: #8a94a6; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -5300,8 +4462,6 @@ if (typeof window !== 'undefined') {
 
 // v1.3.1：资料库列表改分批渲染（懒加载），窗口计算是纯函数、有单测
 
-// v1.4.0：标题中译的展示规则（同样是纯函数、有单测）
-
 
 const PANEL_HTML = `
 <button class="fab" id="fab" title="JAV 标签助手">标签</button>
@@ -5354,7 +4514,6 @@ const PANEL_HTML = `
         <button class="btn" id="btnDumpDom">🧬 DOM 采样</button>
         <button class="btn" id="btnProbeLib">🔬 建库/播放入口探针</button>
         <button class="btn" id="btnSampleRow">🎬 采样视频行结构</button>
-        <button class="btn" id="btnTitleSample">🈶 译名对照（看哪条没译好）</button>
       </div>
 
       <div class="list" id="scanList" style="margin-top:12px"></div>
@@ -5422,7 +4581,6 @@ const PANEL_HTML = `
         现在能排在一行。详细说明都在 title 里。
       -->
       <div class="btnrow">
-        <button class="btn sm primary" id="btnTranslate" title="用本地术语表把日文标题译成中文（不联网、免费）">🌐 翻译</button>
         <button class="btn sm" id="btnLibClearFilter" title="清空关键词与演员 / 类别筛选">清空筛选</button>
         <button class="btn sm" id="btnLibExport" title="把整个资料库导出成 JSON 备份">导出资料库</button>
         <button class="btn sm" id="btnPurgeGone" title="把已失效（网盘里已不存在）的条目从资料库移除">🗑 清理失效</button>
@@ -5519,30 +4677,15 @@ const PANEL_HTML = `
 
       <div style="border-top:1px solid #eef0f3;margin:14px 0 12px"></div>
       <div class="hint" style="margin-bottom:8px">
-        <b>标题中译</b>。用本地术语表把日文片名译成中文 ——
-        <b>不联网、不花钱、无内容审核问题</b>。
+        <b>列表标题显示行数</b>。面板宽度固定，标题少占一行，列表就多露出一条。
+        选一行时鼠标悬停能看到完整标题。
       </div>
       <div class="row">
-        <label style="width:96px">标题显示</label>
-        <select class="grow" id="cfgTitleDisplay">
-          <option value="zh">只显示中文（原文放悬停，推荐）</option>
-          <option value="zh-ja">中文一行 + 原文一行</option>
-          <option value="ja">只显示原文</option>
+        <label style="width:96px">标题行数</label>
+        <select class="grow" id="cfgTitleLines">
+          <option value="1">1 行（推荐，一屏能多看约 1.3 条）</option>
+          <option value="2">2 行（标题长时更完整）</option>
         </select>
-      </div>
-      <div class="row">
-        <label class="grow">查询后自动翻译新标题</label>
-        <input type="checkbox" id="cfgAutoTranslate" style="width:auto">
-      </div>
-      <div class="hint" style="margin:8px 0">
-        词典 <b id="cfgGlossaryVer">—</b>。
-        想提高命中率就编辑 <code>src/core/glossary.js</code> 的词条表，
-        再把 <code>GLOSSARY_VERSION</code> 加一后重新构建 ——
-        <b>已译条目会自动重译</b>（缓存哈希里含词典版本）。
-        哪些词没译到，点「数据/排障」里的<b>🈶 译名对照</b>一看便知。
-      </div>
-      <div class="row">
-        <button class="btn" id="btnRetranslate" style="width:100%">🔄 用当前词典全部重译</button>
       </div>
 
       <div class="btnrow">
@@ -5731,6 +4874,31 @@ function createPanel(handlers = {}) {
   });
 
   /* ---- 设置读写 ---- */
+
+  /*
+   * 列表标题的显示行数（1 / 2），从设置里读一次后缓存。
+   * ★ 原实现是每次筛选都 `await loadSettings()`，而它只为了拿「怎么显示标题」
+   *   这一个值 —— 一次 IndexedDB 往返换一个数字不划算。保存设置时同步更新缓存，
+   *   所以用户改完立刻生效，不需要失效重读。
+   */
+  let titleLinesCache = 1;
+  let titleLinesLoaded = false;
+
+  /** 拿标题行数（只在第一次真的读一次设置） */
+  async function titleLines() {
+    if (!titleLinesLoaded) {
+      try {
+        const cfg = await loadSettings();
+        titleLinesCache = cfg.titleLines === 2 ? 2 : 1;
+      } catch (e) {
+        console.warn('[jv115-tagger] 读设置失败，标题行数按 1 行处理', e);
+        titleLinesCache = 1;
+      }
+      titleLinesLoaded = true;
+    }
+    return titleLinesCache;
+  }
+
   async function loadConfigToForm() {
     const cfg = await loadSettings();
     $('#cfgEnableJavbus').checked = cfg.enableJavbus !== false;
@@ -5748,12 +4916,10 @@ function createPanel(handlers = {}) {
     $('#cfgDmmAffId').value = cfg.dmmAffiliateId || '';
     $('#cfgPlayerUrl').value = cfg.playerUrlTemplate || DEFAULT_PLAYER_URL;
     $('#cfgPlayMode').value = cfg.playMode === 'inpage' ? 'inpage' : 'page';
-    // 标题中译
-    const modes = ['zh', 'zh-ja', 'ja'];
-    $('#cfgTitleDisplay').value = modes.includes(cfg.titleDisplay) ? cfg.titleDisplay : 'zh';
-    $('#cfgAutoTranslate').checked = cfg.autoTranslateTitles !== false;
-    const gv = $('#cfgGlossaryVer');
-    if (gv) gv.textContent = `v${GLOSSARY_VERSION} · ${glossarySize()} 词条`;
+    // 列表标题显示行数（顺手缓存，列表渲染就不必再读一次设置）
+    titleLinesCache = cfg.titleLines === 2 ? 2 : 1;
+    titleLinesLoaded = true;
+    $('#cfgTitleLines').value = String(titleLinesCache);
   }
 
   $('#btnSaveCfg').addEventListener('click', async () => {
@@ -5779,10 +4945,10 @@ function createPanel(handlers = {}) {
       await setSetting('playerUrlTemplate', playerUrl || DEFAULT_PLAYER_URL);
     }
     await setSetting('playMode', $('#cfgPlayMode').value === 'inpage' ? 'inpage' : 'page');
-    // 标题中译
-    const td = $('#cfgTitleDisplay').value;
-    await setSetting('titleDisplay', ['zh', 'zh-ja', 'ja'].includes(td) ? td : 'zh');
-    await setSetting('autoTranslateTitles', $('#cfgAutoTranslate').checked);
+    // 列表标题行数：改完立刻生效 —— 同步更新缓存，列表不必重读设置
+    titleLinesCache = $('#cfgTitleLines').value === '2' ? 2 : 1;
+    titleLinesLoaded = true;
+    await setSetting('titleLines', titleLinesCache);
     toast('设置已保存', 'ok');
     handlers.onSettingsChanged?.();
   });
@@ -5878,8 +5044,7 @@ function createPanel(handlers = {}) {
    * 筛选是纯内存过滤：库里通常几百到几千条，直接遍历足够快，
    * 不需要为每个维度建查询计划。
    * ================================================================ */
-  // titleMode：标题显示方式，渲染前从设置里读一次（见 applyLibFilter）
-  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleMode: 'zh' };
+  const libState = { kw: '', actresses: [], genres: [], rows: [], facets: null, titleLines: 1 };
 
   /** 重新从库里读一次，并刷新下拉筛选器 + 列表 */
   async function loadLibrary() {
@@ -6082,27 +5247,13 @@ function createPanel(handlers = {}) {
     else if (!r.pickcode) badge = '<span class="badge warn">缺提取码</span>';
 
     /*
-     * v1.4.1：默认只显示**一行中文**，原文放进 `title` 属性（鼠标悬停才看）。
-     * 术语表翻译是机器产物、只当索引用，原文才是权威 —— 但让原文常驻第二行，
-     * 列表每条都占两行，扫起来反而费劲（v1.4.0 就是这么做的，实测不好用）。
-     * 没有译文时老实退回原文（`titleDisplayParts` 里保证不留空白）。
-     *
-     * 角标分「译 / 半」：只译到一两个词的标题不再冒充完整译名。
-     * v1.4.0 一律标「译」，于是 56% 覆盖率的标题看着和译好的没区别，
-     * 用户的结论只能是「根本没翻译」。
+     * 标题直接显示元数据里的原日文标题。
+     * 显示几行由 `.lib-list` 上的 `lines-1 / lines-2` 控制（样式见 ui.js）：
+     * 单行时超出部分被省略号截断，`title` 属性保证悬停能看到全文。
+     * 面板宽度固定，标题少占一行，列表就多露出一条 —— 这是「一屏多看几条」
+     * 里最容易被忽略、也最稳定的一处。
      */
-    const t = titleDisplayParts(r, libState.titleMode);
-    const cov = Number(r.titleCoverage);
-    const pct = Number.isFinite(cov) ? Math.round(cov * 100) : null;
-    const zhBadge = t.badge === 'full'
-      ? '<span class="badge tr" title="本地术语表翻译，非官方译名">译</span>'
-      : t.badge === 'part'
-        ? `<span class="badge tr half" title="只译到一部分${pct == null ? '' : `（约 ${pct}%）`}，剩下的仍是日文 —— 术语表翻不掉长句里的动词活用和助词">半</span>`
-        : '';
-    const subLine = t.sub
-      ? `<div class="ttl-ja" title="原日文标题">${escapeHtml(t.sub)}</div>`
-      : '';
-    const ttlTip = t.hover ? `原日文标题：${t.hover}` : t.main;
+    const ttl = r.title || r.fileName || '';
 
     const playTitle = r.pickcode
       ? '在新标签页打开播放页'
@@ -6111,8 +5262,7 @@ function createPanel(handlers = {}) {
     return `<div class="lib-item" data-id="${escapeHtml(r.id)}">
       <div class="mid">
         <div class="code">${escapeHtml(r.code || '—')}${badge}</div>
-        <div class="ttl" title="${escapeHtml(ttlTip)}">${escapeHtml(t.main)}${zhBadge}</div>
-        ${subLine}
+        <div class="ttl" title="${escapeHtml(ttl)}">${escapeHtml(ttl)}</div>
         <div class="tags">${tagLine}</div>
       </div>
       <div class="act">
@@ -6183,6 +5333,12 @@ function createPanel(handlers = {}) {
   function renderLibList(rows) {
     const list = $('#libList');
     if (libObserver) { libObserver.disconnect(); libObserver = null; }
+    /*
+     * 标题行数挂在**容器**上，不是给每条加样式：
+     * 一次 class 切换胜过给已渲染的 50 个节点逐个改。
+     */
+    list.classList.toggle('lines-1', libState.titleLines !== 2);
+    list.classList.toggle('lines-2', libState.titleLines === 2);
     libState.rows = rows;      // 与调用方保持一致（applyLibFilter 也会赋值）
     libShown = 0;
     if (!rows.length) {
@@ -6203,9 +5359,8 @@ function createPanel(handlers = {}) {
         actresses: libState.actresses,
         genres: libState.genres
       });
-      // 每次渲染前读一次显示方式：用户在设置里改完，回到列表就能生效
-      const cfg = await loadSettings();
-      libState.titleMode = cfg.titleDisplay || 'zh';
+      // 标题行数是纯展示设置：从缓存拿，只在第一次真的读一次设置
+      libState.titleLines = await titleLines();
     } catch (e) {
       toast(`筛选失败：${e.message}`, 'err');
       return;
@@ -6218,26 +5373,13 @@ function createPanel(handlers = {}) {
     const noPc = rows.filter((r) => !r.pickcode && !r.gone).length;
     const filtered = rows.length !== total;
     /*
-     * 标题中译的完成度按三档报。
-     * ★ 别退回「已译 N 条」这种口径 —— 只要有一处改动就算「已译」的话，
-     *   一条只把「同窓会」译成「同窗会」、其余全是日文的标题也算译好了，
-     *   面板显示「已译 3293 条」而列表看着像没生效，两边都没说谎。
-     */
-    const trFull = libState.facets ? (libState.facets.trFull || 0) : 0;
-    const trPart = libState.facets ? (libState.facets.trPart || 0) : 0;
-    /*
-     * 统计行现在被 CSS 钉成**单行**（`.lib-stat`），所以文案必须短，
-     * 否则会被省略号截掉。完整说法放 title，悬停可看。
-     * 术语也保持简短：「译好 / 半译」对应原来的「译得动 / 半译」。
+     * 统计行被 CSS 钉成**单行**（`.lib-stat`），所以短文案必须压得住，
+     * 否则会被省略号截掉。完整说法放 `title`，悬停可看。
      */
     const statShort = [
       `共 ${total} 条`,
       filtered ? `命中 ${rows.length}` : '',
       `标签 ${tagged}`,
-      (trFull || trPart)
-        ? `译好 <span style="color:#2b5cff">${trFull}</span>`
-          + ` / 半译 <span style="color:#8a6d3b">${trPart}</span>`
-        : '',
       noPc ? `<span style="color:#a06a00">缺提取码 ${noPc}</span>` : '',
       gone ? `<span style="color:#c0322b">已失效 ${gone}</span>` : ''
     ].filter(Boolean);
@@ -6246,7 +5388,6 @@ function createPanel(handlers = {}) {
       `资料库共 ${total} 条`,
       filtered ? `当前筛选命中 ${rows.length} 条` : '',
       `其中 ${tagged} 条有标签`,
-      (trFull || trPart) ? `中译：译好（能读）${trFull} 条 · 半译 ${trPart} 条` : '',
       noPc ? `缺提取码 ${noPc} 条` : '',
       gone ? `已失效 ${gone} 条` : ''
     ].filter(Boolean).join(' · ');
@@ -6308,37 +5449,6 @@ function createPanel(handlers = {}) {
       await deleteLibrary(id);
       toast(`已移除 ${row.code || row.fileName}`, 'ok');
       await loadLibrary();
-    }
-  });
-
-  /* ---- 标题中译（v1.4.0） ---- */
-  $('#btnTranslate').addEventListener('click', async () => {
-    const r = await handlers.onTranslateTitles?.();
-    // 译完立刻重跑一次筛选：列表读的是 library 里的副本，不重查就看不到新译文
-    await loadLibrary();
-    if (r && r.changed === 0 && r.total) {
-      api.setHint(`没有新的标题需要翻译（词典 v${GLOSSARY_VERSION}）。`
-        + '如果标题还是日文，用「🈶 译名对照」看看哪些词没收录。');
-    }
-  });
-
-  $('#btnRetranslate').addEventListener('click', async () => {
-    const r = await handlers.onRetranslateTitles?.();
-    await loadLibrary();
-    if (r) api.setHint(`已按当前词典 v${GLOSSARY_VERSION} 重译 ${r.done} 条，其中 ${r.changed} 条有译文。`);
-  });
-
-  $('#btnTitleSample').addEventListener('click', async () => {
-    const text = await handlers.onTitleSample?.();
-    if (!text) { api.setHint('对照表生成失败，请看控制台'); return; }
-    console.log(text);
-    try {
-      await navigator.clipboard.writeText(text);
-      toast('译名对照已复制到剪贴板', 'ok');
-      api.setHint('对照表已复制。最前面那批就是「词典里缺的词」，照着补词条即可。');
-    } catch (e) {
-      toast('复制失败（浏览器限制），已输出到控制台', 'err');
-      api.setHint('对照表请看控制台（F12）。');
     }
   });
 
@@ -6465,8 +5575,6 @@ function clamp(value, min, max, fallback) {
  */
 
 
-
-// 标题中译：纯本地术语表，不联网、零成本、无审核问题
 
 // 注意：不再 import renderTagPill —— 蓝点/悬停方案已弃用，
 // 标签统一展示在面板的「资料库」页签里。
@@ -6851,19 +5959,6 @@ async function queryAndCache(codes, force = false) {
       try { await putMetaBatch(metaRecords); } catch (e) { console.warn('[jv115] 落库失败', e); }
     }
 
-    /*
-     * 标题中译：跟着查询顺手做掉。
-     * 纯本地计算（术语表替换），不联网、不花钱、毫秒级，所以可以默认开着；
-     * 但它是增量的 —— 已经译过且原文没变的条目会被哈希挡掉，不会重复算。
-     */
-    if (settings?.autoTranslateTitles !== false) {
-      try {
-        await translateTitles(false, { silent: true });
-      } catch (e) {
-        console.warn('[jv115-tagger] 标题中译失败（不影响查询结果）', e);
-      }
-    }
-
     // 通知列表 frame 用刚写入的缓存重绘
     broadcast('render-cache');
 
@@ -6882,141 +5977,6 @@ async function queryAndCache(codes, force = false) {
     console.error('[jv115-tagger] 查询异常:', e);
     renderFailure(panel, FAIL.ERROR, { error: e.message });
   }
-}
-
-/* ==================================================================
- * 标题中译（v1.4.0）
- * ------------------------------------------------------------------
- * 纯本地：一张术语表 + 专名保护，不联网、零成本、没有内容审核问题。
- * 目标定成「看得懂」，不是「信达雅」—— 这是路线选择的前提。
- *
- * 三件事保证它长期可用：
- *   ① 翻译**按番号**缓存进 meta，同一部片只算一次
- *   ② 缓存键 = hash(原文 + 词典版本)，**改了词典就自动重译**
- *   ③ 没命中的假名如实统计出来，用户照着补词条即可
- *
- * 全部逻辑都在 core/glossary.js（纯函数、有单测），这里只负责批量与落库。
- * ================================================================== */
-
-/**
- * 把库里还没有中文标题的条目补上译文（增量）。
- * @param {boolean} force             忽略缓存全部重译（改完词条后用）
- * @param {{silent?:boolean}} [opt]   silent = 由查询流程顺手调用，不弹提示
- */
-async function translateTitles(force = false, { silent = false } = {}) {
-  const all = await getAllMeta();
-  const withTitle = all.filter((m) => m && m.code && m.title);
-  const todo = withTitle.filter((m) => force || !m.titleZh || m.titleHash !== hashTitle(m.title));
-
-  if (!todo.length) {
-    const msg = withTitle.length
-      ? `标题中译：${withTitle.length} 条已是最新（词典 v${GLOSSARY_VERSION}）`
-      : '标题中译：库里还没有元数据，先查询一次再试';
-    if (!silent) toast(msg, 'ok');
-    panel?.setHint(msg);
-    return { total: withTitle.length, done: 0, changed: 0 };
-  }
-
-  if (!silent) panel?.setBusy(true, `正在翻译 ${todo.length} 条标题…`);
-
-  const entries = [];
-  let changed = 0;
-  let missed = 0;
-  let full = 0;
-
-  for (let i = 0; i < todo.length; i++) {
-    const m = todo[i];
-    const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
-    /*
-     * 只要有一处改动就存译文 —— 这是有意的：
-     * 半译总比不译强，用户至少能认出「同窓会」是「同窗会」。
-     * 但**必须同时存覆盖率**，否则界面上分不出「译得动」和「只译到一两个词」，
-     * 一条 56% 的标题会和完整译名长得一模一样。
-     */
-    entries.push({
-      code: m.code,
-      // 没译出来就存空串，让列表老实回退到原文，而不是存一份和原文一样的「译文」
-      titleZh: r.changed ? r.zh : '',
-      titleSrc: r.changed ? 'glossary' : '',
-      titleCoverage: r.changed ? Math.round(r.coverage * 1000) / 1000 : 0,
-      // ★ 没命中也要记哈希：否则每次都会把同一批「没命中」的条目重新算一遍
-      titleHash: hashTitle(m.title),
-      titleZhAt: Date.now()
-    });
-    if (r.changed) {
-      changed++;
-      if (r.coverage >= FULL_COVERAGE) full++;
-    } else missed++;
-    if (i % 200 === 199) {
-      if (!silent) panel?.setProgress(i + 1, todo.length);
-      // 让出主线程：几千条时不能把页面卡死
-      await new Promise((res) => setTimeout(res, 0));
-    }
-  }
-
-  await applyTitleZhBatch(entries);
-  broadcast('render-cache');
-
-  /*
-   * 报数要如实：只说「N 条译出」会让人以为有 N 条可用，
-   * 实际其中不少只译到一两个词。所以把「译得动」单独拎出来说。
-   */
-  const part = changed - full;
-  const msg = `✅ 标题中译：${full} 条译得动 · ${part} 条只译到一部分 · ${missed} 条未命中`
-    + ` · 词典 v${GLOSSARY_VERSION}（${glossarySize()} 词条）`;
-  if (silent) {
-    panel?.setHint(msg);
-  } else {
-    panel?.setBusy(false, msg);
-    panel?.setHint(
-      part || missed
-        ? '术语表是「词对词替换」，长句里剩下的动词活用和助词它翻不掉，'
-          + '所以会有「一半中文一半日文」的条目 —— 这是纯本地方案的天花板，不是没生效。'
-          + '想提高覆盖率：把常用词补进 core/glossary.js，把 GLOSSARY_VERSION +1 后重新构建，已译条目会自动重译。'
-        : '全部译出，没有残留日文。'
-    );
-    toast(`标题中译完成：${full} 条译得动 · ${part} 条半译`, 'ok');
-  }
-  return { total: withTitle.length, done: todo.length, changed, full, missed };
-}
-
-/**
- * 生成「译名对照 + 待补词条清单」文本。
- *
- * 为什么把**译得最差的排在最前**：
- *   这个功能的日常维护就是「补词条」。用户需要一眼看到哪些标题还剩日文，
- *   而不是看一堆已经译好的。所以按覆盖率升序，直接把缺口怼到脸上。
- */
-async function titleSampleText() {
-  const all = (await getAllMeta()).filter((m) => m && m.title);
-  if (!all.length) return '库里还没有元数据。先到「扫描」页签查询一次，再来看对照表。';
-
-  const rows = all.map((m) => {
-    const r = translateTitle(m.title, { code: m.code, actresses: m.actresses });
-    return {
-      code: m.code, ja: m.title, zh: r.changed ? r.zh : '',
-      coverage: r.coverage, unmapped: r.unmapped, bad: r.bad
-    };
-  });
-  const ok = rows.filter((x) => x.zh).length;
-  const avg = Math.round((rows.reduce((s, x) => s + x.coverage, 0) / rows.length) * 100);
-
-  const worst = [...rows].sort((a, b) => a.coverage - b.coverage || a.code.localeCompare(b.code)).slice(0, 25);
-
-  const L = [];
-  L.push(`===== 标题中译对照（词典 v${GLOSSARY_VERSION} · ${glossarySize()} 词条）=====`);
-  L.push(`元数据 ${rows.length} 条 · 已译出 ${ok} 条 · 平均覆盖率 ${avg}%`);
-  L.push('');
-  L.push('--- 最需要补词条的 25 条（「未译」就是词典里没有的词）---');
-  worst.forEach((x, i) => {
-    L.push(`[${i + 1}] ${x.code}   覆盖率 ${Math.round(x.coverage * 100)}%${x.bad ? `（保护专名 ${x.bad} 个）` : ''}`);
-    L.push(`    原文: ${x.ja}`);
-    L.push(`    译文: ${x.zh || '(未命中，保留原文)'}`);
-    if (x.unmapped.length) L.push(`    未译: ${x.unmapped.join(' / ')}`);
-  });
-  L.push('');
-  L.push('补词方法：编辑 src/core/glossary.js 的词典表 → GLOSSARY_VERSION +1 → 重新构建，已译条目会自动重译。');
-  return L.join('\n');
 }
 
 /** 启动 */
@@ -7218,13 +6178,6 @@ async function bootstrap() {
           return null;
         }
       },
-      /* 标题中译（v1.4.0，纯本地术语表）：只补还没译过的 */
-      onTranslateTitles: () => translateTitles(false),
-      /* 改完词典后强制全部重译（缓存哈希里含词典版本，其实会自动失效，
-         这个按钮是给「我就想立刻全刷一遍」用的） */
-      onRetranslateTitles: () => translateTitles(true),
-      /* 「译名对照」：输出前 25 条译得最差的，方便照着补词条 */
-      onTitleSample: () => titleSampleText(),
       /* 「收录本目录」：优先走 115 官方接口拿全量，失败才回退页面扫描。
          默认是**增量**：已收录且标签完好的文件不会重新请求数据源。
          目录以后新增了视频，再点一次这个按钮就行。 */

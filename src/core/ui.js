@@ -200,7 +200,7 @@ input:focus, select:focus { border-color: #2b5cff; }
 
 /*
  * 统计行：钉死单行。
- * 原来「资料库共 3869 条 · 当前筛选命中 59 条 · 其中 59 条有标签 · 中译译得动 560 …」
+ * 原来「资料库共 3869 条 · 当前筛选命中 59 条 · 其中 59 条有标签 · 缺提取码 …」
  * 在 352px 内必然折成两行，白占 18px。文案缩短 + nowrap + 省略号，
  * 无论后面再拼多少段都只占一行；完整含义放进 title。
  */
@@ -281,24 +281,19 @@ input:focus, select:focus { border-color: #2b5cff; }
 }
 .lib-item .badge.warn { background: #fff6e0; color: #a06a00; border: 1px solid #f2dfb0; }
 .lib-item .badge.bad  { background: #fdeceb; color: #c0322b; border: 1px solid #f5cdc9; }
-/* 标题主行：v1.4.0 起这里是**中文**（没译出时退回原文） */
+/* 标题：行数由 .lib-list 上的 lines-1 / lines-2 决定（见下方规则） */
 .lib-item .ttl {
   font-size: 12.5px; color: #1f2329; margin-top: 2px; line-height: 1.45;
   overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 /*
- * 原日文副行：机器译名只当索引用，原文才是权威，所以保留但压暗。
- * v1.4.1 起默认不再显示这一行（原文改到鼠标悬停），只有把显示方式切成
- * 「中文一行 + 原文一行」时才用得上。
+ * 标题行数切换。面板宽固定 380px，标题少占一行列表就多露出一条
+ * （单行约多 1.3 条），所以默认 1 行，超出部分靠 title 属性悬停看全文。
+ * 挂在容器上而不是逐条改样式 —— 换一次 class 比遍历 50 个节点便宜。
  */
-.lib-item .ttl-ja {
-  font-size: 11px; color: #9aa3b2; margin-top: 1px; line-height: 1.4;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-/* 「译」= 这份译文基本能读；「半」= 只译到一部分，剩下的还是日文 */
-.lib-item .badge.tr { background: #eef2ff; color: #2b5cff; border: 1px solid #ccd8ff; }
-.lib-item .badge.tr.half { background: #fdf6e8; color: #8a6d3b; border-color: #f0e0c0; }
+.lib-list.lines-1 .lib-item .ttl { -webkit-line-clamp: 1; }
+.lib-list.lines-2 .lib-item .ttl { -webkit-line-clamp: 2; }
 .lib-item .tags {
   font-size: 11px; color: #8a94a6; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

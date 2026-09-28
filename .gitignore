@@ -4,9 +4,6 @@ node_modules/
 # 平台 / 工具目录，不随仓库分发
 .workbuddy/
 
-# 第三方站点的抓取样本，仅本地调试用（含第三方页面内容，不公开）
-javbus-probe/
-
 # 系统与编辑器
 .DS_Store
 Thumbs.db
